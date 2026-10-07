@@ -1,0 +1,20 @@
+# Scope captures — routinely 10M samples / ~200 MB each
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Local snapshots and earlier iterations, kept for reference but not worth
+# versioning. The design history is in NTSC_FINDINGS.md and NTSC_SCORECARD.md.
+# Delete the relevant line if you do want one of these tracked.
+Working.py
+NTSC_Bars.py
+NTSC_Bars_HW*.py
+NTSC_Signal_Generation.py
+NTSC_Signal_Generation_Capture.py
