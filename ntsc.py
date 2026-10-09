@@ -142,7 +142,11 @@ SAVE_CAPTURE = None
 IRE = 1.0 / 140.0
 V_SYNC = 0.0
 V_BLANK = 40 * IRE                 # 0.2857 V
-V_BLACK = 47.5 * IRE               # 0.3393 V (7.5 IRE pedestal)
+# Setup pedestal. 7.5 IRE is NTSC-M (North America); 0 is zero setup, used by
+# NTSC-J (Japan) and by much modern gear, where black sits at blanking. --setup
+# changes it, and set_setup_ire() recomputes everything derived from it.
+SETUP_IRE = 7.5
+V_BLACK = (40 + SETUP_IRE) * IRE   # 0.3393 V at 7.5 IRE setup
 V_WHITE = 140 * IRE                # 1.0000 V
 
 V_MID = (V_SYNC + V_WHITE) / 2.0   # 0.5 V -> AWG offset
@@ -198,8 +202,13 @@ def active_lines():
     return TOTAL_LINES - VBI_LINES
 
 
+PATTERNS = ("bars8", "gray8", "white")
+
+
 def active_level(frac):
     """Luma for a point `frac` (0..1) across the active part of a line."""
+    if PATTERN == "white":
+        return V_WHITE                   # flat 100 IRE level reference
     idx = min(int(frac * 8), 7)
     if PATTERN == "gray8":
         return V_WHITE - (V_WHITE - V_BLACK) * (idx / 7.0)
@@ -614,6 +623,64 @@ def pick_config(dwf, for_stream=False, force=None):
     return best_idx
 
 
+def report_output_window(dwf, hdwf, ch, amplitude, offset):
+    """Print what the AWG actually accepted, against what we asked for.
+
+    Amplitude and offset are clamped to what the selected configuration
+    supports, so a request is not a measurement. Must be called AFTER
+    FDwfAnalogOutConfigure: with FDwfDeviceAutoConfigureSet(0) nothing is
+    applied until then, and a Get before it returns the device's previous
+    state -- which reads exactly like a clamp and is not one. A mismatch on a
+    value that lies inside the range the device itself reports is therefore a
+    stale readback, never a clamp; only --analyze settles what came out.
+
+    These are the device's own output figures, before any series resistor and
+    before the chain loads it. Do not assume the series divider is 0.5 -- it
+    is whatever the chain actually presents, so measure it.
+    """
+    lim = {}
+    for name, info, get in (
+            ("amplitude", dwf.FDwfAnalogOutNodeAmplitudeInfo,
+             dwf.FDwfAnalogOutNodeAmplitudeGet),
+            ("offset", dwf.FDwfAnalogOutNodeOffsetInfo,
+             dwf.FDwfAnalogOutNodeOffsetGet)):
+        lo, hi, got = ctypes.c_double(), ctypes.c_double(), ctypes.c_double()
+        check(dwf, info(hdwf, ch, AnalogOutNodeCarrier,
+                        ctypes.byref(lo), ctypes.byref(hi)), name + "Info")
+        check(dwf, get(hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(got)),
+              name + "Get")
+        lim[name] = (lo.value, hi.value, got.value)
+
+    clamped = False
+    for name, want in (("amplitude", amplitude), ("offset", offset)):
+        lo, hi, got = lim[name]
+        print(f"      {name:9} asked {want:+.4f} V -> device {got:+.4f} V "
+              f"(range {lo:+.3f}..{hi:+.3f})")
+        if abs(want - got) <= 1e-3:
+            continue
+        if lo - 1e-9 <= want <= hi + 1e-9:
+            # The request is inside the range the device itself reports, so it
+            # cannot have been clamped -- the readback is stale, not the
+            # output. Measure the output instead of believing this number.
+            print(f"      NOTE: {name} readback disagrees by "
+                  f"{abs(want - got) * 1000:.1f} mV but {want:+.4f} is inside "
+                  f"the device's own {lo:+.3f}..{hi:+.3f} range, so this is a "
+                  f"stale readback, not a clamp. Trust --analyze.")
+            continue
+        clamped = True
+        print(f"      WARNING: {name} clamped by "
+              f"{abs(want - got) * 1000:.1f} mV -- {want:+.4f} V is outside "
+              f"the device's {lo:+.3f}..{hi:+.3f} range. The sample data is "
+              f"fine; the output window is not, so levels will read low.")
+
+    amp, off = lim["amplitude"][2], lim["offset"][2]
+    tail = (" -> half of that into a terminated 75 ohm load"
+            if SOURCE_SERIES_75R else "")
+    print(f"      at W1: {off - amp:+.4f} V .. {off + amp:+.4f} V "
+          f"({2 * amp * 1000:.1f} mV p-p){tail}")
+    return not clamped
+
+
 def start_awg(dwf, hdwf, ch, spl, rate, quiet=False):
     # Same voltage handling as the deep path, so the only difference between
     # them is the playback mechanism -- not the DC level or the window.
@@ -657,6 +724,7 @@ def start_awg(dwf, hdwf, ch, spl, rate, quiet=False):
     dwf.FDwfAnalogOutIdleSet(hdwf, ch, DwfAnalogOutIdleInitial)
     check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
           "AnalogOutConfigure")
+    report_output_window(dwf, hdwf, ch, amplitude, offset)
 
     got = ctypes.c_double()
     dwf.FDwfAnalogOutNodeFrequencyGet(hdwf, ch, AnalogOutNodeCarrier,
@@ -808,6 +876,7 @@ def start_stream(dwf, hdwf, ch, spl, rate, scale=1.0, colour=False):
           "NodeDataSet")
     check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
           "AnalogOutConfigure")
+    report_output_window(dwf, hdwf, ch, amplitude, offset)
     # Read back rather than assume: a play rate that silently did not take is
     # indistinguishable from a feed-loop bug by looking at the feed rate.
     gf = ctypes.c_double()
@@ -1066,27 +1135,48 @@ SC_RATIO = 227.5                   # fsc / line rate, exactly
 FSC_NOMINAL = False
 FSC_HZ = 3579545.0
 V_SYNC_IRE = -0.40                 # -40 IRE
-V_BLACK_IRE = 0.075                # 7.5 IRE setup pedestal
+V_BLACK_IRE = SETUP_IRE / 100.0    # pedestal as a fraction of white
 BURST_AMP = 0.20                   # 40 IRE peak-to-peak
 BURST_START_US = 5.3               # after start of sync: 0.6 us into back porch
 # Measured against a broadcast generator through the same chain: its burst
 # envelope starts at 4.80 us and reaches 40.9 IRE, where ours started at 5.34
 # and reached 36.0. --burst-start and --burst-amp make those adjustable.
 BURST_CYCLES = 9
-CHROMA_GAIN = 0.925                # same compression the setup applies to luma
+CHROMA_GAIN = 1.0 - V_BLACK_IRE    # same compression the setup applies to luma
 SATURATION = 1.0                   # --sat to trim
 
+
+def set_setup_ire(ire):
+    """Set the setup pedestal, in IRE, and everything derived from it.
+
+    Luma maps 0..1 onto pedestal..white, so the pedestal costs active range;
+    chroma takes the same gain to keep saturation matched to luma. At 0 IRE
+    black and blanking coincide and --vbi-black becomes a no-op.
+    """
+    global SETUP_IRE, V_BLACK, V_BLACK_IRE, CHROMA_GAIN
+    if not 0.0 <= ire <= 20.0:
+        raise RuntimeError(f"--setup {ire} IRE is outside 0..20.")
+    SETUP_IRE = ire
+    V_BLACK = (40 + ire) * IRE
+    V_BLACK_IRE = ire / 100.0
+    CHROMA_GAIN = 1.0 - V_BLACK_IRE
+
 # 75% EIA colour bars, in R'G'B' 0..1, standard left-to-right order.
-COLOUR_BARS = (
-    (0.75, 0.75, 0.75),            # white
-    (0.75, 0.75, 0.00),            # yellow
-    (0.00, 0.75, 0.75),            # cyan
-    (0.00, 0.75, 0.00),            # green
-    (0.75, 0.00, 0.75),            # magenta
-    (0.75, 0.00, 0.00),            # red
-    (0.00, 0.00, 0.75),            # blue
-    (0.00, 0.00, 0.00),            # black
+# Bar amplitude. 75% is the EIA/SMPTE norm and peaks at 76.88 IRE, NOT 100 --
+# setup + 0.925 x 0.75. --bar-amp 100 gives full-amplitude bars (100 IRE white,
+# and yellow/cyan chroma peaks reaching ~131 IRE, which some inputs clip).
+BAR_AMP = 0.75
+BAR_PRIMARIES = (
+    (1, 1, 1),                     # white
+    (1, 1, 0),                     # yellow
+    (0, 1, 1),                     # cyan
+    (0, 1, 0),                     # green
+    (1, 0, 1),                     # magenta
+    (1, 0, 0),                     # red
+    (0, 0, 1),                     # blue
+    (0, 0, 0),                     # black
 )
+COLOUR_BARS = tuple(tuple(BAR_AMP * c for c in bar) for bar in BAR_PRIMARIES)
 
 
 def yuv(r, g, b):
@@ -1096,6 +1186,16 @@ def yuv(r, g, b):
 
 
 BAR_YUV = tuple(yuv(*c) for c in COLOUR_BARS)
+
+
+def set_bar_amp(pct):
+    """Set colour-bar amplitude, in percent, and rebuild the bar table."""
+    global BAR_AMP, COLOUR_BARS, BAR_YUV
+    if not 0.0 < pct <= 100.0:
+        raise RuntimeError(f"--bar-amp {pct} is outside 0..100 percent.")
+    BAR_AMP = pct / 100.0
+    COLOUR_BARS = tuple(tuple(BAR_AMP * c for c in bar) for bar in BAR_PRIMARIES)
+    BAR_YUV = tuple(yuv(*c) for c in COLOUR_BARS)
 
 
 def colour_fields():
@@ -1167,8 +1267,12 @@ def build_colour_volts(spl, rate):
     # Every active line carries the same bars, so build and band-limit the
     # luma and chroma envelopes once and reuse them.
     ya, ua, va = [], [], []
+    # --pattern white is a flat 100 IRE field, no chroma: the signal to set
+    # output level by, since 75% bars peak at 76.88 IRE and never reach 100.
+    bars = ((1.0, 0.0, 0.0),) if PATTERN == "white" else BAR_YUV
+    nb = len(bars)
     for k in range(active_n):
-        y, u, v = BAR_YUV[min(k * 8 // active_n, 7)]
+        y, u, v = bars[min(k * nb // active_n, nb - 1)]
         ya.append(V_BLACK_IRE + (1.0 - V_BLACK_IRE) * y)
         ua.append(u * CHROMA_GAIN * SATURATION)
         va.append(v * CHROMA_GAIN * SATURATION)
@@ -1419,6 +1523,7 @@ def start_deep(dwf, hdwf, ch, spl, rate, scale, func, colour=False):
     dwf.FDwfAnalogOutIdleSet(hdwf, ch, DwfAnalogOutIdleInitial)
     check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
           "AnalogOutConfigure")
+    report_output_window(dwf, hdwf, ch, amplitude, offset)
 
     gf, grun = ctypes.c_double(), ctypes.c_double()
     dwf.FDwfAnalogOutNodeFrequencyGet(hdwf, ch, AnalogOutNodeCarrier,
@@ -2652,7 +2757,8 @@ def main():
     opts = {"--lines", "--spl", "--pattern", "--save-capture",
             "--stream-rate", "--play-scale", "--config", "--sat",
             "--sys-clock", "--capture", "--seconds", "--level",
-            "--burst-start", "--burst-amp", "--copies"}
+            "--burst-start", "--burst-amp", "--copies", "--setup",
+            "--bar-amp"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -2699,6 +2805,8 @@ def main():
     if "--locked" in argv:
         print(f"Preset --locked: level 0.9, burst {BURST_AMP * 200:.0f} IRE "
               f"at {BURST_START_US} us, infinite run")
+    set_setup_ire(opt("--setup", float, SETUP_IRE))
+    set_bar_amp(opt("--bar-amp", float, BAR_AMP * 100.0))
     VBI_BLACK = "--vbi-black" in argv
     LOOP_ALIGN = "--no-loop-align" not in argv
     SYS_CLOCK = opt("--sys-clock", float, None)
@@ -2713,6 +2821,9 @@ def main():
     SAVE_CAPTURE = opt("--save-capture", str, None)
     TOTAL_LINES = opt("--lines", int, TOTAL_LINES)
     PATTERN = opt("--pattern", str, PATTERN)
+    if PATTERN not in PATTERNS:
+        raise RuntimeError(f"Unknown --pattern {PATTERN!r}; "
+                           f"choose from {', '.join(PATTERNS)}.")
     spl_force = opt("--spl", int, None)
 
     if "--color" in argv and not ({"--deep", "--stream"} & set(argv)):

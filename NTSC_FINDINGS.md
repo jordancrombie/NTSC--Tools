@@ -161,6 +161,77 @@ data `(v − 0.5) / 0.5`.
 **Vertical-interval lines sit at BLANKING (0 IRE), not black.** The 7.5 IRE
 setup pedestal applies to active picture only.
 
+**A 75 ohm series resistor does not raise the level — it cannot.** The AWG is
+a near-zero-impedance source. Compare, at a 75 ohm terminated load:
+
+| | AWG drive | at the load |
+|---|---|---|
+| no resistor, no flag | 1.00 V p-p | **1.00 V p-p** |
+| 75 ohm + `--series-75` (x2) | 2.00 V p-p | **1.00 V p-p** |
+
+Identical. `--series-75` doubles the drive and the 75/75 divider halves it
+back. The resistor buys a correct *source impedance* (no reflection off an
+unterminated stub — the usual cause of edge overshoot), not amplitude. Level is
+`--level`, and with the resistor fitted `--level` means the same thing at the
+load as it did without it.
+
+**OPEN: `--series-75` doubled the drive and the reading went DOWN.** Measured
+with a 75 ohm resistor fitted in series with W1, reading peak white off a flat
+100 IRE field (`--pattern white`) on the Leader:
+
+| run (resistor fitted both times) | AWG drive | read at the Leader | implied path gain |
+|---|---|---|---|
+| `--level 1.0` (no flag) | 1.00 V p-p | **100 IRE** | 1.00 |
+| `--level 1.0 --series-75` | 2.00 V p-p | **72 IRE** | 0.36 |
+
+**These are mutually inconsistent.** A passive linear chain cannot produce less
+output from more drive, so no single path gain explains both rows. Candidates,
+none yet confirmed:
+
+1. The larger amplitude/offset request is being clamped by the configuration.
+   `report_output_window()` now reads back what the AWG actually accepted,
+   against its real limits, in all three generation paths -- added precisely to
+   settle this without guessing.
+2. The Leader was overloaded on the second row (2 V p-p into an input expecting
+   1 V) and the reading is not meaningful.
+3. The resistor is not in series the way it looks, or is not 75 ohm.
+4. Something else moved between the runs (a termination switch, the Leader's
+   gain/scale setting).
+
+Note row 1's gain of 1.00 implies the chain is **unterminated**, since a 75 ohm
+series resistor into a 75 ohm load would read 50 IRE. That contradicts a
+monitor that is displaying a picture, which is a further reason to distrust the
+model rather than the measurements.
+
+**Lesson, again:** the two changes in that A/B were *designed* to cancel
+(resistor + x2 at gain 0.50 == no resistor + x1 at gain 1.00, both 100 IRE), so
+when they didn't cancel I reached for a cause. I assumed the resistor had been
+removed, concluded "double termination, or a 133 ohm resistor", and wrote it up
+with a confident table. The premise was wrong. Confirm what changed between two
+runs before explaining why they differ.
+
+**75% bars cannot reach 100 IRE.** Peak white is `setup + 0.925 x 0.75` =
+**76.88 IRE**, and `--locked` carries `--level 0.9`, so the default command
+tops out at **69.2 IRE**. That is correct, not a loss. Calibrate level against
+`--pattern white` (a flat 100.00 IRE field, no chroma) or use `--bar-amp 100`
+for full-amplitude bars, where chroma peaks reach 134 IRE.
+
+**The setup pedestal is a variant, not a constant.** 7.5 IRE is NTSC-M (North
+America); NTSC-J (Japan) and much modern gear use **zero setup**, where black
+and blanking coincide. `--setup <IRE>` selects it, and three things have to
+move together or saturation stops matching luma:
+
+| | 7.5 IRE setup | zero setup |
+|---|---|---|
+| black | 0.3393 V (+7.5 IRE) | 0.2857 V (0 IRE) |
+| luma map | `0.075 + 0.925·Y` | `Y` |
+| chroma gain | 0.925 | 1.0 |
+| 75% bar peak white | 76.88 IRE | 75.00 IRE |
+
+The pedestal costs active range, so chroma takes the same `1 − setup` gain the
+luma compression applies. Sync depth, blanking and burst amplitude do not move.
+At zero setup `--vbi-black` becomes a no-op, since black *is* blanking.
+
 **Interlace — the one that caused the flagging:**
 - 525 lines, two fields of 262.5, field 59.94 Hz, frame 29.97 Hz
 - **Horizontal sync runs on ONE continuous grid for the entire frame.** The

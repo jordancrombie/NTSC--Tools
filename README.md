@@ -38,6 +38,40 @@ behave like a real video source: 286 mV of sync depth into a terminated load,
 the same level either way, which is correct into a terminated load but reads
 half of what a broadcast generator does in an unterminated chain.
 
+**The series resistor cannot raise the level at a terminated load, and is not
+meant to.** `--series-75` doubles the AWG drive and the 75 Ω / 75 Ω divider
+halves it again, so the load sees exactly what it saw with no resistor and no
+flag. What the resistor buys is a correct source impedance — no reflections off
+an unterminated stub, which is what edge overshoot usually is. To change
+*level*, use `--level`.
+
+**`--series-75` assumes a divider you have to verify.** The ×2 is only right
+if the chain presents a single 75 Ω termination. Always check the level against
+a flat `--pattern white` field after fitting the resistor; don't assume the ×2
+landed. On this bench it didn't — see the open item in
+[NTSC_FINDINGS.md](NTSC_FINDINGS.md).
+
+Without the resistor the source impedance is ~0 Ω, so it ignores the load and
+the level is correct no matter how the chain terminates. That is the safe
+default, and it is why `--series-75` is off unless asked for.
+
+## Setting output level
+
+75% bars peak at **76.88 IRE** by construction (setup + 0.925 × 0.75) and never
+reach 100, so they are the wrong thing to calibrate against. Use a flat field:
+
+```bash
+# flat 100 IRE white field -- set --level so the monitor reads 100 IRE
+python3 ntsc.py --deep --color --play-scale 1.0 --locked --pattern white
+
+# full-amplitude bars: 100 IRE white, chroma peaks ~134 IRE (some inputs clip)
+python3 ntsc.py --deep --color --play-scale 1.0 --locked --bar-amp 100
+```
+
+Note that `--locked` includes `--level 0.9`, i.e. everything runs 10% low:
+76.88 × 0.9 = **69.2 IRE** peak white on default bars. Add `--level 1.0` to
+undo that once the chain tolerates it.
+
 ## What it produces
 
 `--deep --color` emits a four-field sequence of 75% EIA colour bars:
@@ -51,6 +85,8 @@ half of what a broadcast generator does in an unterminated chain.
 | subcarrier | 3.579295 MHz, locked to exactly 227.5 × line rate |
 | sequence | 953,400 samples, 238,875 whole subcarrier cycles — loops seamlessly |
 | levels | sync −40 IRE, blanking 0, black +7.5, white +100 |
+| setup | 7.5 IRE pedestal (`--setup 0` for zero-setup / NTSC-J) |
+| bar amplitude | 75% EIA, peak white 76.88 IRE (`--bar-amp 100` for full) |
 | burst | 9 cycles, 40 IRE p-p, 0.63 µs breezeway |
 
 Chroma vector angles land within **0.04°** of the published NTSC vectorscope
@@ -129,7 +165,10 @@ assume.
   interlaced frame is 119,437.5 cycles and needs **four fields** to close.
   Progressive 262 lines is 59,605 cycles exactly and closes in one frame.
 - Vertical-interval lines sit at **blanking (0 IRE)**, not black. The 7.5 IRE
-  setup pedestal applies to active picture only.
+  setup pedestal applies to active picture only. `--setup <IRE>` moves the
+  pedestal (0 gives zero-setup NTSC-J, where black and blanking coincide);
+  luma maps 0..1 onto pedestal..white and chroma takes the same gain, so 75%
+  bars peak at 76.88 IRE with setup and exactly 75.00 without it.
 - Saturated red and blue on 75% bars legally reach **−16 IRE**, so a sync
   slicer set at −12 IRE will false-trigger on chroma.
 
