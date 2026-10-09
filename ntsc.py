@@ -3002,6 +3002,23 @@ def start_motion(dwf, hdwf, ch, spl, rate, scale):
     return big_n
 
 
+def stream_chunk(fifo, fill, remaining):
+    """Samples to hand over now, given the estimated FIFO fill.
+
+    `fill` may be NEGATIVE when the feed has fallen behind the playhead, and
+    clamping it at zero is what keeps the request inside the FIFO. Without the
+    clamp, being 0.13 ms behind asks for 34,669 samples of a 32,768-sample
+    FIFO and the device rejects the whole call with "Invalid data count
+    provided". feed_tune's loop had the clamp; porting it into stream_feed
+    dropped it.
+
+    The redundant `fifo` term is a deliberate invariant: whatever the fill
+    estimate does, the request can never exceed the FIFO.
+    """
+    room = fifo - max(0.0, fill)
+    return max(0, int(min(room, fifo, remaining)))
+
+
 def pick_stream_config(dwf, force=None):
     """Configuration that can actually stream: play memory 0, deepest scope.
 
@@ -3064,9 +3081,10 @@ def stream_feed(dwf, hdwf, ch, source, total, rate, fifo, poll=0.1,
     fed = 0
     free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
     sts = ctypes.c_ubyte()
-    t_poll = t_rep = 0.0
+    t_poll = 0.0
+    t_rep = report              # not 0.0: at t~0 the rate divides by nothing
     t0 = time.time()
-    worst_fill = fifo
+    worst_fill = float("inf")
     try:
         while True:
             now = time.time() - t0
@@ -3081,8 +3099,9 @@ def stream_feed(dwf, hdwf, ch, source, total, rate, fifo, poll=0.1,
                           f"corrupted {corrupt.value:,}")
                 t_poll = now + poll
             fill = fed - now * rate
-            worst_fill = min(worst_fill, fill)
-            n = int(min(fifo - fill, total - pos))
+            if now > 0.25:            # ignore the startup transient
+                worst_fill = min(worst_fill, fill)
+            n = stream_chunk(fifo, fill, total - pos)
             if n <= 0:
                 continue
             if dwf.FDwfAnalogOutNodePlayData(hdwf, ch, AnalogOutNodeCarrier,
@@ -3097,17 +3116,18 @@ def stream_feed(dwf, hdwf, ch, source, total, rate, fifo, poll=0.1,
                 if on_wrap is not None:
                     on_wrap()
             if now >= t_rep:
-                print(f"  {now:6.1f} s  fed {fed / max(now, 1e-9) / 1e6:6.3f} "
+                wf = (0.0 if worst_fill == float("inf")
+                      else worst_fill / rate * 1000)
+                print(f"  {now:6.1f} s  fed {fed / now / 1e6:6.3f} "
                       f"MS/s (need {rate / 1e6:.3f})  fill "
-                      f"{fill / rate * 1000:5.2f} ms  min "
-                      f"{worst_fill / rate * 1000:5.2f} ms  "
+                      f"{fill / rate * 1000:+5.2f} ms  min {wf:+5.2f} ms  "
                       f"lost {lost.value:,}  corrupt {corrupt.value:,}")
                 t_rep = now + report
     except KeyboardInterrupt:
         el = time.time() - t0
+        wf = 0.0 if worst_fill == float("inf") else worst_fill / rate * 1000
         print(f"\nStopped after {el:.1f} s: {fed / 1e6:.1f} M samples at "
-              f"{fed / el / 1e6:.3f} MS/s, minimum fill "
-              f"{worst_fill / rate * 1000:.2f} ms")
+              f"{fed / el / 1e6:.3f} MS/s, minimum fill {wf:.2f} ms")
 
 
 def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
