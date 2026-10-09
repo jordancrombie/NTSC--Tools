@@ -3063,6 +3063,46 @@ def pick_stream_config(dwf, force=None):
     return best
 
 
+def describe_capture(samples, dt_us):
+    """Say what a capture actually contains when no sync was found.
+
+    profile_capture reports nan for everything when it finds no h-sync, which
+    says nothing about why. A flat trace, a noisy one and a real waveform at
+    the wrong level all produce the same nans, and they need different fixes.
+    """
+    srt = sorted(samples)
+    n = len(srt)
+    q = lambda f: srt[min(n - 1, int(f * n))]
+    lo, hi = q(0.005), q(0.995)
+    print(f"\n=== capture has no recognisable h-sync ===")
+    print(f"  {n:,} samples, {n * dt_us:.2f} us at "
+          f"{1.0 / dt_us:.1f} MS/s")
+    print(f"  min {min(samples) * 1000:+8.1f} mV   max "
+          f"{max(samples) * 1000:+8.1f} mV   p-p "
+          f"{(max(samples) - min(samples)) * 1000:8.1f} mV")
+    print(f"  percentiles  0.5% {lo * 1000:+8.1f}   50% {q(0.5) * 1000:+8.1f}"
+          f"   99.5% {hi * 1000:+8.1f} mV")
+    span = hi - lo
+    if span < 0.050:
+        print(f"  FLAT: 99% of samples inside {span * 1000:.1f} mV. Nothing is "
+              f"driving the input, or the capture missed the signal.")
+        return
+    # How long does it stay below the sync threshold? Real sync is ~4.7 us.
+    runs = runs_below(samples, dt_us, lo + 0.13 * span)
+    if runs:
+        w = sorted(x for _, x in runs)
+        print(f"  {len(runs):,} runs below the sync threshold, widths "
+              f"{w[0]:.3f}..{w[-1]:.3f} us, median {w[len(w) // 2]:.3f} "
+              f"(h-sync should be ~4.7)")
+        if w[-1] < 0.5:
+            print(f"  NOISE: the longest excursion is {w[-1] * 1000:.0f} ns. "
+                  f"This is a threshold crossed by noise, not sync pulses. "
+                  f"The usual cause is an unsettled input stage -- discard one "
+                  f"capture after setup_scope.")
+    print(f"  first 16 samples (mV): "
+          + " ".join(f"{v * 1000:+.0f}" for v in samples[:16]))
+
+
 def stream_line_jitter(samples, dt_us, rate, spl):
     """Line-to-line sync spacing from a capture -- the "sync slightly off" test.
 
@@ -3234,8 +3274,8 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                         # defaults to 0.020 for 50 MS/s), not seconds.
                         dt_us = 1e6 / scope_rate
                         prof = profile_capture(samples, dt_us)
-                        if prof is None:
-                            print("  profile: too few sync edges to measure")
+                        if prof is None or not prof.get("counts", (0,))[0]:
+                            describe_capture(samples, dt_us)
                         else:
                             show_profile(prof, "streamed output")
                         stream_line_jitter(samples, dt_us, rate, spl_hint)
@@ -3374,6 +3414,12 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
     print("\nStreaming unbounded motion. Press Ctrl+C to stop.")
     if STREAM_CAPTURE_AT is not None:
         setup_scope(dwf, hdwf)
+        # Mandatory, and documented in setup_scope: the FIRST acquisition
+        # after a range change comes back at the wrong level. Every other
+        # caller in this file discards one; skipping it here produced a
+        # capture with 38,755 one-sample "pulses" and no sync at all. Do it
+        # before the AWG starts, so it costs the feed nothing.
+        capture(dwf, hdwf, 25e6, 1 << 16)              # discard: settling
     stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo,
                 rate_check=STREAM_RATE_CHECK, spl_hint=spl,
                 capture_at=STREAM_CAPTURE_AT, capture_path=SAVE_CAPTURE)
