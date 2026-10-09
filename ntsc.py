@@ -3154,6 +3154,10 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
     cap_n = int(capture_s * scope_rate) if capture_at is not None else 0
     cap_state = "idle"
     in_sts = ctypes.c_ubyte()
+    # Its own timer. Sharing t_poll with the PlayStatus poll meant that block
+    # advanced the deadline first and this one never fired at all.
+    t_cap = 0.0
+    cap_armed_at = 0.0
     try:
         while True:
             now = time.time() - t0
@@ -3198,10 +3202,19 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                           f"{capture_s * 1000:.1f} ms at "
                           f"{scope_rate / 1e6:.0f} MS/s")
                     cap_state = "armed"
-                elif cap_state == "armed" and now >= t_poll:
+                    cap_armed_at = now
+                    t_cap = now + 0.05
+                elif cap_state == "armed" and now >= t_cap:
+                    t_cap = now + 0.05
                     dwf.FDwfAnalogInStatus(hdwf, ctypes.c_int(0),
                                            ctypes.byref(in_sts))
-                    if in_sts.value == DwfStateDone:
+                    if (in_sts.value != DwfStateDone
+                            and now - cap_armed_at > 10.0):
+                        print(f"  capture timed out after 10 s in state "
+                              f"{DWF_STATE_NAMES.get(in_sts.value, in_sts.value)}"
+                              f" -- no trigger? nothing written.")
+                        cap_state = "done"
+                    elif in_sts.value == DwfStateDone:
                         print(f"  acquired at {now:.1f} s "
                               f"(lost {t_lost:,}, corrupt {t_corr:,} so far)")
                         dwf.FDwfAnalogInStatus(hdwf, ctypes.c_int(1),
