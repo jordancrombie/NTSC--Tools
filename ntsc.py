@@ -3002,197 +3002,172 @@ def start_motion(dwf, hdwf, ch, spl, rate, scale):
     return big_n
 
 
+def pick_stream_config(dwf, force=None):
+    """Configuration that can actually stream: play memory 0, deepest scope.
+
+    Measured by --feed-matrix: PlayData reaches W1 only where
+    DECIAnalogOutPlaySize is 0. The configurations advertising 67 M or 134 M
+    of play memory accept PlayData at 63-72 MS/s, report zero lost and zero
+    corrupted, and play the primed buffer on loop instead -- so pick_deep_config
+    is exactly the wrong chooser for a stream.
+    """
+    ndev, ncfg = ctypes.c_int(), ctypes.c_int()
+    check(dwf, dwf.FDwfEnum(ctypes.c_int(0), ctypes.byref(ndev)), "FDwfEnum")
+    if ndev.value == 0:
+        raise RuntimeError("No Digilent device found. Close WaveForms and replug.")
+    check(dwf, dwf.FDwfEnumConfig(ctypes.c_int(0), ctypes.byref(ncfg)),
+          "FDwfEnumConfig")
+    best, best_scope = -1, -1
+    for i in range(ncfg.value):
+        play, scope = ctypes.c_int(), ctypes.c_int()
+        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogOutPlaySize,
+                               ctypes.byref(play))
+        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogInBufferSize,
+                               ctypes.byref(scope))
+        print(f"  config {i}: play memory {play.value} samples, "
+              f"scope buffer {scope.value}"
+              + ("  <- can stream" if play.value == 0 else ""))
+        if play.value == 0 and scope.value > best_scope:
+            best, best_scope = i, scope.value
+    if force is not None:
+        print(f"  -> config {force} (forced)")
+        return force
+    if best < 0:
+        raise RuntimeError("No configuration reports play memory 0, so none "
+                           "can stream on this unit. Run --feed-matrix.")
+    print(f"  -> config {best} (streams; scope buffer {best_scope:,})")
+    return best
+
+
+def stream_feed(dwf, hdwf, ch, source, total, rate, fifo, poll=0.1,
+                report=5.0, on_wrap=None):
+    """Feed `source` cyclically at `rate`, paced against the clock.
+
+    `source` is a ctypes double array of `total` samples; it is fed on repeat.
+    `on_wrap()` is called each time the read position wraps, so a caller can
+    regenerate the buffer in place for genuinely unbounded content.
+
+    The structure is the only one measured to sustain the colour rate, and it
+    is driven by two numbers from --feed-tune:
+
+      AnalogOutStatus  1792 us    PlayStatus  2 us
+
+    AnalogOutStatus is far too slow for the hot loop -- with it in, the
+    SDK-example loop is clean only to 2 MS/s. But PlayStatus returns STALE
+    values unless AnalogOutStatus is called, so `free` cannot be trusted
+    either. Pacing the fill against the wall clock needs neither: the device
+    consumes at exactly the rate we set, so fill = fed - elapsed * rate.
+    PlayStatus is still polled occasionally, purely to read the lost and
+    corrupted counters.
+    """
+    pos = 0
+    fed = 0
+    free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+    sts = ctypes.c_ubyte()
+    t_poll = t_rep = 0.0
+    t0 = time.time()
+    worst_fill = fifo
+    try:
+        while True:
+            now = time.time() - t0
+            if now >= t_poll:
+                # Cheap (2 us) and only for the counters -- never for sizing.
+                dwf.FDwfAnalogOutNodePlayStatus(hdwf, ch, AnalogOutNodeCarrier,
+                                                ctypes.byref(free),
+                                                ctypes.byref(lost),
+                                                ctypes.byref(corrupt))
+                if lost.value or corrupt.value:
+                    print(f"  underrun at {now:.1f} s: lost {lost.value:,}, "
+                          f"corrupted {corrupt.value:,}")
+                t_poll = now + poll
+            fill = fed - now * rate
+            worst_fill = min(worst_fill, fill)
+            n = int(min(fifo - fill, total - pos))
+            if n <= 0:
+                continue
+            if dwf.FDwfAnalogOutNodePlayData(hdwf, ch, AnalogOutNodeCarrier,
+                                             ctypes.byref(source, pos * 8),
+                                             ctypes.c_int(n)) != 1:
+                raise RuntimeError(f"PlayData refused {n} samples at "
+                                   f"{now:.2f} s: {last_error(dwf)}")
+            fed += n
+            pos += n
+            if pos >= total:
+                pos = 0
+                if on_wrap is not None:
+                    on_wrap()
+            if now >= t_rep:
+                print(f"  {now:6.1f} s  fed {fed / max(now, 1e-9) / 1e6:6.3f} "
+                      f"MS/s (need {rate / 1e6:.3f})  fill "
+                      f"{fill / rate * 1000:5.2f} ms  min "
+                      f"{worst_fill / rate * 1000:5.2f} ms  "
+                      f"lost {lost.value:,}  corrupt {corrupt.value:,}")
+                t_rep = now + report
+    except KeyboardInterrupt:
+        el = time.time() - t0
+        print(f"\nStopped after {el:.1f} s: {fed / 1e6:.1f} M samples at "
+              f"{fed / el / 1e6:.3f} MS/s, minimum fill "
+              f"{worst_fill / rate * 1000:.2f} ms")
+
+
 def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
-    """Stream an endless bouncing ball by appending with PlayData.
+    """Stream the bouncing ball indefinitely, regenerating as it wraps.
 
-    UNVERIFIED: this path has never put a picture on a screen. It feeds at the
-    right rate with lost and corrupt both zero, and W1 stays dead. Priming the
-    whole sequence with DataSet displays; priming the 32768-sample DataInfo
-    prefill and streaming does not, and the prime size is the only variable
-    that tracks whether anything comes out. --stream-probe does not settle it
-    either: it measured how fast PlayData calls return, never that a sample
-    reached the output. Kept behind --motion-stream to finish diagnosing.
-    Use --motion, which loops a multi-sequence buffer out of deep memory.
-
-    Primes play memory with one four-field sequence, then appends further
-    sequences for as long as it runs. The feed holds a bounded in-flight
-    depth rather than feeding everything PlayStatus reports free: free is the
-    whole 134 M play memory, so feeding it all buffers 9.4 s and then overruns
-    (measured: 211,200 corrupted samples at a 4 Mi chunk).
+    This is the architecture for feeding an arbitrary signal: the buffer holds
+    one four-field sequence, and on_wrap repaints it with the next one, so the
+    content never repeats and is not bounded by play memory.
     """
     bg, total, amplitude, offset, ball_n, blank_n, fsc = \
         build_motion_background(spl, rate)
     geom = motion_geometry(spl, rate)
-    if geom["total"] != total:
-        raise RuntimeError(f"geometry/background disagree: "
-                           f"{geom['total']} vs {total} samples")
     fields = geom["fields"]
     field_s = total / fields / rate
     work = (ctypes.c_double * total)()
     seq = 0
 
     def build_next():
-        """Background, then the ball painted over it as contiguous runs."""
         nonlocal seq
         ctypes.memmove(work, bg, total * 8)
-        painted = 0
         for f in range(fields):
             t = (seq * fields + f) * field_s
             for idx, vals in ball_runs(geom, f, t, ball_n, blank_n):
                 work[idx:idx + len(vals)] = vals
-                painted += len(vals)
         seq += 1
-        return painted
+    build_next()
 
-    t_build = time.time()
-    painted = build_next()
-    t_build = time.time() - t_build
-    print(f"      sequence build {t_build * 1000:.1f} ms for {total:,} samples "
-          f"({painted:,} painted), budget {total / rate * 1000:.1f} ms "
-          f"-> {t_build / (total / rate) * 100:.1f}% of real time")
-
-    # Reset first: the probe did and start_motion did not, and leftover
-    # state from the --deep setup is one fewer variable to wonder about.
     check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
     dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
-    for fn_, a in ((dwf.FDwfAnalogOutNodeEnableSet, ctypes.c_int(1)),
-                   (dwf.FDwfAnalogOutNodeFunctionSet, funcPlay)):
-        check(dwf, fn_(hdwf, ch, AnalogOutNodeCarrier, a), "node setup")
-    pmin, pmax = ctypes.c_int(), ctypes.c_int()
-    check(dwf, dwf.FDwfAnalogOutNodePlayInfo(hdwf, ch, AnalogOutNodeCarrier,
-                                             ctypes.byref(pmin),
-                                             ctypes.byref(pmax)), "PlayInfo")
-    cap = pmax.value
-    scale_v = LEVEL * (2.0 if SOURCE_SERIES_75R else 1.0)
+    check(dwf, dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_int(1)), "NodeEnableSet")
+    # funcPlayPattern with run and repeat left at their defaults, as
+    # AnalogOut_PlayTest.py does for continuous streaming.
+    check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier,
+                                                funcPlayPattern),
+          "NodeFunctionSet")
     check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
         hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(rate / scale)),
         "FrequencySet")
+    scale_v = LEVEL * (2.0 if SOURCE_SERIES_75R else 1.0)
     check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
         hdwf, ch, AnalogOutNodeCarrier,
         ctypes.c_double(amplitude * scale_v)), "AmplitudeSet")
     check(dwf, dwf.FDwfAnalogOutNodeOffsetSet(
         hdwf, ch, AnalogOutNodeCarrier,
         ctypes.c_double(offset * scale_v)), "OffsetSet")
-    check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(0.0)),
-          "RunSet")
-    check(dwf, dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(0)),
-          "RepeatSet")
-    # Prefill the SMALL DataInfo buffer, not the whole sequence. A full
-    # DataSet with run 0 and repeat 0 is exactly how start_deep makes a static
-    # signal loop forever, so priming the whole sequence here makes the device
-    # repeat sequence 0 and ignore the stream -- which looks like a ball stuck
-    # in the corner, because t=0 puts it at (r, r) and one sequence is only
-    # 66.7 ms of travel. DataInfo reports 32768 for every function and
-    # configuration, so the wait is what keeps playback from starving before
-    # the first PlayData lands.
-    dmin, pre = ctypes.c_int(), ctypes.c_int()
-    check(dwf, dwf.FDwfAnalogOutNodeDataInfo(
-        hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(dmin),
-        ctypes.byref(pre)), "DataInfo")
-    n_pre = min(pre.value, total)
+    cbuf = ctypes.c_int(0)
+    check(dwf, dwf.FDwfAnalogOutNodeDataInfo(hdwf, ch, AnalogOutNodeCarrier, 0,
+                                             ctypes.byref(cbuf)), "DataInfo")
+    fifo = max(1, cbuf.value)
     check(dwf, dwf.FDwfAnalogOutNodeDataSet(
-        hdwf, ch, AnalogOutNodeCarrier, work, ctypes.c_int(n_pre)), "DataSet")
-    check(dwf, dwf.FDwfAnalogOutWaitSet(hdwf, ch,
-                                        ctypes.c_double(START_WAIT_S)),
-          "WaitSet")
+        hdwf, ch, AnalogOutNodeCarrier, work, ctypes.c_int(fifo)), "DataSet")
     check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
           "Configure")
     report_output_window(dwf, hdwf, ch, amplitude * scale_v, offset * scale_v)
-
-    print(f"      play memory {cap:,} samples ({cap / rate:.2f} s); "
-          f"prefill {n_pre:,} ({n_pre / rate * 1000:.2f} ms), "
-          f"chunk {FEED_CHUNK:,}, wait {START_WAIT_S:.1f} s")
-    print("\nStreaming motion. Press Ctrl+C to stop.")
-
-    sts = ctypes.c_ubyte()
-    free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
-    pos = n_pre                      # carry on where the prefill stopped
-    fed = n_pre                      # the prefill counts as handed over
-    iters = idle = 0
-    t0 = last = time.time()
-    t_run = None
-    started = False
-    try:
-        while True:
-            check(dwf, dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts)),
-                  "AnalogOutStatus")
-            if sts.value == DwfStateRunning:
-                if not started:
-                    t_run = time.time()
-                started = True
-            elif started:
-                raise RuntimeError(
-                    f"AWG left the running state "
-                    f"({DWF_STATE_NAMES.get(sts.value, sts.value)}) after "
-                    f"{lost.value:,} lost, {corrupt.value:,} corrupted")
-            elif time.time() - t0 > START_WAIT_S + 2.0:
-                raise RuntimeError(
-                    f"AWG never started: state "
-                    f"{DWF_STATE_NAMES.get(sts.value, sts.value)} after "
-                    f"{time.time() - t0:.1f} s (wait is {START_WAIT_S} s). "
-                    f"Nothing will reach W1.")
-            check(dwf, dwf.FDwfAnalogOutNodePlayStatus(
-                hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
-                ctypes.byref(lost), ctypes.byref(corrupt)), "PlayStatus")
-            iters += 1
-
-            # Feed what PlayStatus reports writable, capped at the chunk size
-            # the probe measured clean. `free` is the WRITABLE SPACE, not the
-            # fill: deriving an in-flight depth as `cap - free` and gating on
-            # it inverts the test and feeds nothing at all. Feeding `free`
-            # directly is self-limiting -- it fills, then settles at the
-            # consumption rate -- and is what the shipped example does.
-            # Throttle against the playhead, not against `free`. `free` was
-            # measured erratic (1.7 M to 130 M within one run) and is kept
-            # only as a safety clamp inside feed_amount.
-            now_ = time.time()
-            played = (now_ - t_run) * rate if t_run else 0.0
-            budget = int(played + FEED_PRELOAD_S * rate) - fed
-            remaining = total - pos if pos < total else total
-            want = feed_amount(free.value, remaining,
-                               min(FEED_CHUNK, max(0, budget)))
-            if want > 0:
-                if pos >= total:
-                    build_next()
-                    pos = 0
-                check(dwf, dwf.FDwfAnalogOutNodePlayData(
-                    hdwf, ch, AnalogOutNodeCarrier,
-                    ctypes.byref(work, pos * 8), ctypes.c_int(want)),
-                    "PlayData")
-                pos += want
-                fed += want
-                idle = 0
-            else:
-                idle += 1
-
-            # Must sit outside any feed condition: a guard that only runs on
-            # the path that feeds cannot fire when the bug is that we never
-            # feed. That is exactly how the inverted depth test shipped.
-            if started and idle > 500 and budget > 0:
-                raise RuntimeError(
-                    f"fed nothing for {idle} consecutive iterations while "
-                    f"running: PlayStatus reports free={free.value:,}, "
-                    f"lost={lost.value:,}. The AWG is starving.")
-
-            now = time.time()
-            if now - last >= 5.0:
-                el = now - t0
-                # Host-side estimate: what we have handed over, less what the
-                # device has had time to consume. Independent of the
-                # counters, whose exact semantics are not documented.
-                buf = max(0, fed - played)
-                print(f"  {el:6.1f} s  {DWF_STATE_NAMES.get(sts.value, '?'):7} "
-                      f"fed {fed / el / 1e6:6.3f} MS/s (need "
-                      f"{rate / 1e6:.3f})  buf {buf / rate * 1000:5.0f} ms  "
-                      f"free {free.value:>11,}  seq {seq:,}  "
-                      f"lost {lost.value:,}  corrupt {corrupt.value:,}")
-                last = now
-    except KeyboardInterrupt:
-        el = time.time() - t0
-        print(f"\nStopped after {el:.1f} s: {seq:,} sequences, "
-              f"{fed / 1e6:.1f} M samples fed at {fed / el / 1e6:.3f} MS/s "
-              f"(need {rate / 1e6:.3f}), last lost {lost.value:,}, "
-              f"corrupt {corrupt.value:,}")
+    print(f"      FIFO {fifo:,} samples ({fifo / rate * 1000:.2f} ms); "
+          f"sequence {total:,} ({total / rate * 1000:.1f} ms), regenerated "
+          f"on every wrap")
+    print("\nStreaming unbounded motion. Press Ctrl+C to stop.")
+    stream_feed(dwf, hdwf, ch, work, total, rate, fifo, on_wrap=build_next)
     return total
 
 
@@ -3826,7 +3801,9 @@ def main():
         return
 
     print("Enumerating...")
-    if "--deep" in argv:
+    if "--motion-stream" in argv:
+        cfg = pick_stream_config(dwf, force=opt("--config", int, None))
+    elif "--deep" in argv:
         cfg = pick_deep_config(dwf, force=opt("--config", int, None))
     else:
         cfg = pick_config(dwf, for_stream="--stream" in argv,
@@ -3875,9 +3852,6 @@ def main():
                   f"({(line_hz / LINE_FREQ_HZ - 1) * 100:+.4f}%)")
             if "--motion" in argv:
                 if "--motion-stream" in argv:
-                    print("NOTE: --motion-stream has never produced output on\n"
-                          "      this device. --motion alone loops deep memory,\n"
-                          "      which is the path measured to reach a screen.")
                     start_motion_stream(dwf, hdwf, ch, spl, rate, scale)
                 else:
                     start_motion(dwf, hdwf, ch, spl, rate, scale)

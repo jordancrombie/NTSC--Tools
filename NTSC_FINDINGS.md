@@ -220,10 +220,40 @@ round trip:
 | PlayStatus + PlayData | 2.83 ms | 11.60 MS/s | short |
 | PlayData only, paced | 1.41 ms | 23.19 MS/s | enough |
 
-Measured was only 1.6-2.1 MS/s, well below even the three-call ceiling, so
-call count is not the whole story. `--feed-tune` sweeps loop structure against
-target rate in a streaming configuration and re-measures the round trip there,
-since 1413 us came from config 3.
+**SETTLED by `--feed-tune`: colour streaming works at 14.295 MS/s.** The whole
+thing turns on one measurement -- the two status calls are not comparable:
+
+| call | cost in a streaming config |
+|---|---|
+| `FDwfAnalogOutStatus` | **1792 us** |
+| `FDwfAnalogOutNodePlayStatus` | **2 us** |
+
+900x apart, and that explains every row:
+
+| loop | max clean | why |
+|---|---|---|
+| Status + PlayStatus + PlayData | 2.0 MS/s | `AnalogOutStatus` in the hot loop |
+| PlayStatus + PlayData | **0** | stale `free`, fed nothing, looped the prime |
+| **PlayData paced, PlayStatus every 100 ms** | **14.286 MS/s** | neither problem |
+
+The two constraints look contradictory and are not: `PlayStatus` returns
+STALE values unless `AnalogOutStatus` is called, but `AnalogOutStatus` is far
+too slow to call per iteration. Pacing the FIFO fill against the wall clock
+needs neither -- the device consumes at exactly the rate we set, so
+`fill = fed - elapsed * rate`. `PlayStatus` is then polled occasionally
+purely to read the lost and corrupted counters. The 2-call row is the proof
+of the stale-`free` half: 0.000 MS/s fed and CH1 sitting on the primed level.
+
+Note the SDK examples use the 3-call form, which is correct and clean -- just
+only to about 2 MS/s on this unit. Audio does not need more.
+
+**The working recipe for feeding arbitrary data:**
+
+1. `pick_stream_config()` -- play memory 0, deepest scope buffer (config 5)
+2. `funcPlayPattern`, run and repeat left at their defaults
+3. prime `DataInfo` samples (32768 = 2.29 ms at the colour rate)
+4. feed with `PlayData` only, sized from a clock-paced fill estimate
+5. poll `PlayStatus` every 100 ms for the counters, never for sizing
 
 What works, and what `--motion` now does: put the whole animation in ONE
 DataSet and let run 0 / repeat 0 loop it in hardware -- the same mechanism
