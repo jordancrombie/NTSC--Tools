@@ -3057,7 +3057,7 @@ def pick_stream_config(dwf, force=None):
 
 
 def stream_feed(dwf, hdwf, ch, source, total, rate, fifo, poll=0.1,
-                report=5.0, on_wrap=None):
+                report=5.0, on_wrap=None, spl_hint=None):
     """Feed `source` cyclically at `rate`, paced against the clock.
 
     `source` is a ctypes double array of `total` samples; it is fed on repeat.
@@ -3077,10 +3077,13 @@ def stream_feed(dwf, hdwf, ch, source, total, rate, fifo, poll=0.1,
     PlayStatus is still polled occasionally, purely to read the lost and
     corrupted counters.
     """
-    pos = 0
-    fed = 0
+    # The prime already delivered the first `fifo` samples, so starting at 0
+    # would replay them once. (start_motion got this right; this did not.)
+    pos = fifo % total
+    fed = fifo
     free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
     sts = ctypes.c_ubyte()
+    actual = 0.0
     t_poll = 0.0
     t_rep = report              # not 0.0: at t~0 the rate divides by nothing
     t0 = time.time()
@@ -3089,7 +3092,28 @@ def stream_feed(dwf, hdwf, ch, source, total, rate, fifo, poll=0.1,
         while True:
             now = time.time() - t0
             if now >= t_poll:
-                # Cheap (2 us) and only for the counters -- never for sizing.
+                # Top the FIFO up FIRST: AnalogOutStatus costs ~1792 us and the
+                # FIFO is only ~2.29 ms deep, so going in empty would underrun.
+                n0 = stream_chunk(fifo, fed - now * rate, total - pos)
+                if n0 > 0:
+                    if dwf.FDwfAnalogOutNodePlayData(
+                            hdwf, ch, AnalogOutNodeCarrier,
+                            ctypes.byref(source, pos * 8),
+                            ctypes.c_int(n0)) != 1:
+                        raise RuntimeError(f"PlayData refused {n0} before poll "
+                                           f"at {now:.2f} s: {last_error(dwf)}")
+                    fed += n0
+                    pos += n0
+                    if pos >= total:
+                        pos = 0
+                        if on_wrap is not None:
+                            on_wrap()
+                # PlayStatus alone returns STALE values, so pay for one
+                # AnalogOutStatus here -- 1792 us every `poll` is ~1.8%. That
+                # buys a trustworthy `free`, and with it the device's REAL
+                # consumption rate: whatever we have fed, less what is still
+                # sitting in the FIFO, over elapsed time. No scope needed.
+                dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts))
                 dwf.FDwfAnalogOutNodePlayStatus(hdwf, ch, AnalogOutNodeCarrier,
                                                 ctypes.byref(free),
                                                 ctypes.byref(lost),
@@ -3097,6 +3121,10 @@ def stream_feed(dwf, hdwf, ch, source, total, rate, fifo, poll=0.1,
                 if lost.value or corrupt.value:
                     print(f"  underrun at {now:.1f} s: lost {lost.value:,}, "
                           f"corrupted {corrupt.value:,}")
+                now = time.time() - t0
+                if now > 0.5:
+                    in_fifo = min(max(0, fifo - free.value), fifo)
+                    actual = (fed - in_fifo) / now
                 t_poll = now + poll
             fill = fed - now * rate
             if now > 0.25:            # ignore the startup transient
@@ -3118,8 +3146,10 @@ def stream_feed(dwf, hdwf, ch, source, total, rate, fifo, poll=0.1,
             if now >= t_rep:
                 wf = (0.0 if worst_fill == float("inf")
                       else worst_fill / rate * 1000)
+                err = (actual / rate - 1.0) * 100.0 if actual else 0.0
                 print(f"  {now:6.1f} s  fed {fed / now / 1e6:6.3f} "
-                      f"MS/s (need {rate / 1e6:.3f})  fill "
+                      f"MS/s  device {actual / 1e6:6.3f} MS/s "
+                      f"({err:+.3f}% vs {rate / 1e6:.3f})  fill "
                       f"{fill / rate * 1000:+5.2f} ms  min {wf:+5.2f} ms  "
                       f"lost {lost.value:,}  corrupt {corrupt.value:,}")
                 t_rep = now + report
@@ -3128,6 +3158,20 @@ def stream_feed(dwf, hdwf, ch, source, total, rate, fifo, poll=0.1,
         wf = 0.0 if worst_fill == float("inf") else worst_fill / rate * 1000
         print(f"\nStopped after {el:.1f} s: {fed / 1e6:.1f} M samples at "
               f"{fed / el / 1e6:.3f} MS/s, minimum fill {wf:.2f} ms")
+        if actual:
+            err = (actual / rate - 1.0) * 100.0
+            print(f"  device consumed {actual / 1e6:.4f} MS/s against "
+                  f"{rate / 1e6:.4f} requested ({err:+.3f}%)")
+            if spl_hint:
+                line_hz = actual / spl_hint
+                print(f"  -> line {line_hz:.2f} Hz (NTSC 15734.27), "
+                      f"field {line_hz / 262.5:.4f} Hz (NTSC 59.9401)")
+            if abs(err) > 0.05:
+                print(f"  A {err:+.3f}% rate error moves the field rate by "
+                      f"{59.94 * err / 100:+.3f} Hz, which is what makes the "
+                      f"picture roll. The play-rate scale is "
+                      f"configuration-dependent; this one was taken from the "
+                      f"--deep configuration.")
 
 
 def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
@@ -3187,7 +3231,8 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
           f"sequence {total:,} ({total / rate * 1000:.1f} ms), regenerated "
           f"on every wrap")
     print("\nStreaming unbounded motion. Press Ctrl+C to stop.")
-    stream_feed(dwf, hdwf, ch, work, total, rate, fifo, on_wrap=build_next)
+    stream_feed(dwf, hdwf, ch, work, total, rate, fifo, on_wrap=build_next,
+                spl_hint=spl)
     return total
 
 
