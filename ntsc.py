@@ -2769,6 +2769,14 @@ BALL_PHASE_X = 0.37
 BALL_PHASE_Y = 0.61
 PICTURE_ASPECT = 4.0 / 3.0
 FEED_CHUNK = 1 << 18               # 256 Ki: 46 MS/s measured, zero corruption
+# How far ahead of the playhead to keep the device. The feed is throttled
+# against the wall clock, not against `free`: the consumption rate is exactly
+# the sample rate we set, so cumulative fed <= elapsed * rate + this is a hard
+# bound on in-flight depth. Feeding `free` instead ran 3.08x too fast and put
+# 760 M samples nowhere, with lost and corrupt both still reporting zero.
+FEED_PRELOAD_S = 0.5
+DWF_STATE_NAMES = {DwfStateArmed: "armed", DwfStateDone: "done",
+                   DwfStateRunning: "running", DwfStateWait: "wait"}
 
 
 def feed_amount(free, remaining, chunk=FEED_CHUNK):
@@ -2983,18 +2991,30 @@ def start_motion(dwf, hdwf, ch, spl, rate, scale):
     sts = ctypes.c_ubyte()
     free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
     pos = n_pre                      # carry on where the prefill stopped
-    fed = iters = idle = 0
+    fed = n_pre                      # the prefill counts as handed over
+    iters = idle = 0
     t0 = last = time.time()
+    t_run = None
     started = False
     try:
         while True:
             check(dwf, dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts)),
                   "AnalogOutStatus")
             if sts.value == DwfStateRunning:
+                if not started:
+                    t_run = time.time()
                 started = True
             elif started:
-                raise RuntimeError(f"AWG stopped (state {sts.value}) after "
-                                   f"{lost.value:,} lost")
+                raise RuntimeError(
+                    f"AWG left the running state "
+                    f"({DWF_STATE_NAMES.get(sts.value, sts.value)}) after "
+                    f"{lost.value:,} lost, {corrupt.value:,} corrupted")
+            elif time.time() - t0 > START_WAIT_S + 2.0:
+                raise RuntimeError(
+                    f"AWG never started: state "
+                    f"{DWF_STATE_NAMES.get(sts.value, sts.value)} after "
+                    f"{time.time() - t0:.1f} s (wait is {START_WAIT_S} s). "
+                    f"Nothing will reach W1.")
             check(dwf, dwf.FDwfAnalogOutNodePlayStatus(
                 hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
                 ctypes.byref(lost), ctypes.byref(corrupt)), "PlayStatus")
@@ -3006,8 +3026,15 @@ def start_motion(dwf, hdwf, ch, spl, rate, scale):
             # it inverts the test and feeds nothing at all. Feeding `free`
             # directly is self-limiting -- it fills, then settles at the
             # consumption rate -- and is what the shipped example does.
+            # Throttle against the playhead, not against `free`. `free` was
+            # measured erratic (1.7 M to 130 M within one run) and is kept
+            # only as a safety clamp inside feed_amount.
+            now_ = time.time()
+            played = (now_ - t_run) * rate if t_run else 0.0
+            budget = int(played + FEED_PRELOAD_S * rate) - fed
             remaining = total - pos if pos < total else total
-            want = feed_amount(free.value, remaining)
+            want = feed_amount(free.value, remaining,
+                               min(FEED_CHUNK, max(0, budget)))
             if want > 0:
                 if pos >= total:
                     build_next()
@@ -3025,7 +3052,7 @@ def start_motion(dwf, hdwf, ch, spl, rate, scale):
             # Must sit outside any feed condition: a guard that only runs on
             # the path that feeds cannot fire when the bug is that we never
             # feed. That is exactly how the inverted depth test shipped.
-            if started and idle > 500:
+            if started and idle > 500 and budget > 0:
                 raise RuntimeError(
                     f"fed nothing for {idle} consecutive iterations while "
                     f"running: PlayStatus reports free={free.value:,}, "
@@ -3037,10 +3064,11 @@ def start_motion(dwf, hdwf, ch, spl, rate, scale):
                 # Host-side estimate: what we have handed over, less what the
                 # device has had time to consume. Independent of the
                 # counters, whose exact semantics are not documented.
-                buf = max(0, total + fed - (now - t0) * rate)
-                print(f"  {el:6.1f} s  fed {fed / el / 1e6:6.3f} MS/s  "
-                      f"free {free.value:>11,}  buf~{buf / rate * 1000:6.0f} ms  "
-                      f"seq {seq:,}  iters/s {iters / el:5.0f}  "
+                buf = max(0, fed - played)
+                print(f"  {el:6.1f} s  {DWF_STATE_NAMES.get(sts.value, '?'):7} "
+                      f"fed {fed / el / 1e6:6.3f} MS/s (need "
+                      f"{rate / 1e6:.3f})  buf {buf / rate * 1000:5.0f} ms  "
+                      f"free {free.value:>11,}  seq {seq:,}  "
                       f"lost {lost.value:,}  corrupt {corrupt.value:,}")
                 last = now
     except KeyboardInterrupt:
