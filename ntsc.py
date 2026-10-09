@@ -3374,6 +3374,186 @@ def feed_matrix(dwf, target=100e6 / 7):
     return good
 
 
+# Loop structures to try in a streaming configuration. The examples use the
+# three-call form; the question is whether dropping calls buys enough rate,
+# because sustaining R with a FIFO of D samples needs a loop period under
+# D/R -- 2.29 ms for 32768 samples at the colour rate.
+FEED_LOOPS = (
+    ("3call", "Status + PlayStatus + PlayData (as the SDK examples)"),
+    ("2call", "PlayStatus + PlayData (drop AnalogOutStatus)"),
+    ("paced", "PlayData only, fill tracked against the clock, "
+              "PlayStatus every 100 ms to resync"),
+)
+
+
+def feed_tune(dwf, secs=1.2):
+    """Maximum sustainable PlayData rate in a streaming configuration.
+
+    Streaming only works where play memory is 0 (measured by --feed-matrix),
+    and those configurations have a FIFO of roughly 32768 samples. So the rate
+    ceiling is FIFO depth divided by loop period, and the loop period is
+    dominated by USB round trips. This measures the round trip in the chosen
+    configuration -- the 1413 us figure came from config 3 and may not apply --
+    then sweeps loop structure against target rate, checking the output each
+    time rather than trusting the counters.
+    """
+    ndev, ncfg = ctypes.c_int(), ctypes.c_int()
+    check(dwf, dwf.FDwfEnum(ctypes.c_int(0), ctypes.byref(ndev)), "FDwfEnum")
+    check(dwf, dwf.FDwfEnumConfig(ctypes.c_int(0), ctypes.byref(ncfg)),
+          "FDwfEnumConfig")
+    cfg, best_scope = -1, -1
+    for i in range(ncfg.value):
+        play, scope = ctypes.c_int(), ctypes.c_int()
+        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogOutPlaySize,
+                               ctypes.byref(play))
+        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogInBufferSize,
+                               ctypes.byref(scope))
+        if play.value == 0 and scope.value > best_scope:
+            cfg, best_scope = i, scope.value
+    if cfg < 0:
+        raise RuntimeError("No configuration with play memory 0; none of them "
+                           "can stream. Run --feed-matrix.")
+    print(f"  streaming configuration {cfg} (play memory 0, scope buffer "
+          f"{best_scope:,})")
+
+    hdwf = ctypes.c_int()
+    check(dwf, dwf.FDwfDeviceConfigOpen(ctypes.c_int(0), ctypes.c_int(cfg),
+                                        ctypes.byref(hdwf)), "ConfigOpen")
+    try:
+        ch = ctypes.c_int(0)
+        setup_scope(dwf, hdwf)
+        sts = ctypes.c_ubyte()
+        free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+
+        # Round trip in THIS configuration, per call type.
+        def timeit(fn, n=150):
+            t = time.time()
+            for _ in range(n):
+                fn()
+            return (time.time() - t) / n
+        rt_s = timeit(lambda: dwf.FDwfAnalogOutStatus(hdwf, ch,
+                                                      ctypes.byref(sts)))
+        rt_p = timeit(lambda: dwf.FDwfAnalogOutNodePlayStatus(
+            hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+            ctypes.byref(lost), ctypes.byref(corrupt)))
+        print(f"  round trip here: AnalogOutStatus {rt_s * 1e6:.0f} us, "
+              f"PlayStatus {rt_p * 1e6:.0f} us")
+
+        SRC = 1 << 18
+        src = (ctypes.c_double * SRC)()
+        for i in range(SRC):
+            src[i] = FEED_STREAM_V
+
+        def arm(target):
+            dwf.FDwfAnalogOutReset(hdwf, ch)
+            dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+            dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
+                                           ctypes.c_int(1))
+            dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier,
+                                             funcPlayPattern)
+            dwf.FDwfAnalogOutNodeFrequencySet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_double(target))
+            dwf.FDwfAnalogOutNodeAmplitudeSet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_double(1.0))
+            cbuf = ctypes.c_int(0)
+            dwf.FDwfAnalogOutNodeDataInfo(hdwf, ch, AnalogOutNodeCarrier, 0,
+                                          ctypes.byref(cbuf))
+            pre = (ctypes.c_double * max(1, cbuf.value))()
+            for i in range(len(pre)):
+                pre[i] = FEED_PRIME_V
+            dwf.FDwfAnalogOutNodeDataSet(hdwf, ch, AnalogOutNodeCarrier, pre,
+                                         ctypes.c_int(len(pre)))
+            dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1))
+            return len(pre)
+
+        def run(kind, target):
+            arm(target)
+            fed = t_lost = t_corr = 0
+            depth = 1 << 15                 # refined from observed cFree
+            t0 = time.time()
+            t_poll = 0.0
+            fill = 0.0
+            err = ""
+            while True:
+                now = time.time() - t0
+                if now >= secs:
+                    break
+                if kind == "3call":
+                    if dwf.FDwfAnalogOutStatus(hdwf, ch,
+                                               ctypes.byref(sts)) != 1:
+                        err = "Status error"; break
+                    if sts.value != DwfStateRunning:
+                        err = DWF_STATE_NAMES.get(sts.value, "?"); break
+                if kind in ("3call", "2call"):
+                    dwf.FDwfAnalogOutNodePlayStatus(
+                        hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                        ctypes.byref(lost), ctypes.byref(corrupt))
+                    t_lost += lost.value
+                    t_corr += corrupt.value
+                    depth = max(depth, free.value)
+                    n = min(free.value, SRC)
+                else:
+                    if now >= t_poll:
+                        dwf.FDwfAnalogOutNodePlayStatus(
+                            hdwf, ch, AnalogOutNodeCarrier,
+                            ctypes.byref(free), ctypes.byref(lost),
+                            ctypes.byref(corrupt))
+                        t_lost += lost.value
+                        t_corr += corrupt.value
+                        depth = max(depth, free.value)
+                        fill = depth - free.value     # resync to the truth
+                        t_poll = now + 0.1
+                    else:
+                        fill = max(0.0, fed - now * target)
+                    n = int(min(depth - fill, SRC))
+                if n <= 0:
+                    continue
+                if dwf.FDwfAnalogOutNodePlayData(
+                        hdwf, ch, AnalogOutNodeCarrier, src,
+                        ctypes.c_int(n)) != 1:
+                    err = "PlayData refused"; break
+                fed += n
+            el = time.time() - t0
+            s = capture(dwf, hdwf, 1e6, 1 << 13)
+            v = sorted(s)[len(s) // 2]
+            return fed / el / 1e6, t_lost, t_corr, v, depth, err
+
+        targets = (1e6, 2e6, 5e6, 8e6, 11e6, 100e6 / 7)
+        print(f"\n  {'loop':6} {'target':>9} {'achieved':>9} {'lost':>8} "
+              f"{'corrupt':>8} {'CH1':>7} {'depth':>8}  verdict")
+        best = {}
+        for kind, _ in FEED_LOOPS:
+            for tg in targets:
+                ms, lo, co, v, depth, err = run(kind, tg)
+                ok = (not err and lo == 0 and co == 0
+                      and abs(v - FEED_STREAM_V) < 0.15
+                      and ms >= tg / 1e6 * 0.95)
+                if ok:
+                    best[kind] = max(best.get(kind, 0.0), tg / 1e6)
+                verdict = err or ("clean" if ok else "underruns")
+                print(f"  {kind:6} {tg / 1e6:9.3f} {ms:9.3f} {lo:>8,} "
+                      f"{co:>8,} {v:+7.3f} {depth:>8,}  {verdict}")
+        print()
+        need = 100e6 / 7 / 1e6
+        for kind, desc in FEED_LOOPS:
+            b = best.get(kind, 0.0)
+            print(f"  {kind:6} max clean {b:6.3f} MS/s "
+                  f"({b / need:4.2f}x colour)  {desc}")
+        top = max(best.values()) if best else 0.0
+        print()
+        if top >= need:
+            print(f"  Colour streaming is achievable at {top:.3f} MS/s.")
+        else:
+            print(f"  Best clean rate {top:.3f} MS/s against "
+                  f"{need:.3f} needed for colour.")
+            print(f"  Monochrome needs far less: 54 samples/line is "
+                  f"{54 * 15734 / 1e6:.3f} MS/s, 370 is "
+                  f"{370 * 15734 / 1e6:.3f} MS/s.")
+        return best
+    finally:
+        dwf.FDwfDeviceClose(hdwf)
+
+
 def stream_probe(dwf, hdwf, ch, target=100e6 / 7):
     """Measure sustainable PlayData throughput, and say what limits it.
 
@@ -3508,6 +3688,7 @@ def main():
              # device capability probes
              "--play-info", "--play-test", "--play-configs", "--pattern-info",
              "--clock-info", "--stream-probe", "--feed-matrix",
+             "--feed-tune",
              # A/B switches for things that were tested and are documented
              "--no-filter", "--sync-tip-zero", "--vbi-black",
              "--no-loop-align", "--fsc-nominal"}
@@ -3628,6 +3809,10 @@ def main():
 
     if "--feed-matrix" in argv:
         feed_matrix(dwf)
+        return
+
+    if "--feed-tune" in argv:
+        feed_tune(dwf)
         return
 
     if "--play-configs" in argv:

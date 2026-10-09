@@ -175,21 +175,55 @@ unterminated stub — the usual cause of edge overshoot), not amplitude. Level i
 `--level`, and with the resistor fitted `--level` means the same thing at the
 load as it did without it.
 
-**OPEN: in config 3, only a full DataSet has ever reached the output.** Three
-runs, one variable:
+**SETTLED: PlayData streams ONLY where play memory is 0.** Measured with
+`--feed-matrix`, which primes DC at -0.5 V and streams DC at +0.5 V so the
+capture says which one is on the wire. Both SDK recipes, all six
+configurations:
 
-| prime | fed | lost/corrupt | reached a screen? |
+| cfg | play memory | max cFree | fed MS/s | CH1 | |
+|---|---|---|---|---|---|
+| 0 | 67,108,864 | 67,098,880 | 63.2 | **-0.499** | loops the prime |
+| 1 | 0 | 16,360 | 1.9 | **+0.502** | **streams** |
+| 2 | 67,108,864 | 67,105,536 | 64.0 | **-0.499** | loops the prime |
+| 3 | 134,217,728 | 134,202,624 | 72.3 | **-0.499** | loops the prime |
+| 4 | 0 | 32,680 | 2.1 | **+0.502** | **streams** |
+| 5 | 0 | 32,688 | 2.0 | **+0.502** | **streams** |
+
+The deep-memory configurations accept PlayData at 63-72 MS/s, report zero
+lost and zero corrupted, and play the primed buffer on loop instead. The
+counters never complain, so only a capture tells you. `pick_deep_config`
+selects the deepest play memory, which is therefore the WORST choice for
+streaming -- that is why `--motion`'s streaming path was dead while `--stream`
+(which uses `pick_config`, preferring play size 0) produced video.
+
+**Our call sequence matched neither shipped recipe.** From the SDK samples:
+
+| | AnalogOut_Play.py | AnalogOut_PlayTest.py | what we had |
 |---|---|---|---|
-| DataSet 953,400 (whole sequence) | 0 | 0/0 | **YES** (looped sequence 0) |
-| DataSet 32,768 + PlayData | 36-44 MS/s | 0/0 | no |
-| DataSet 32,768 + PlayData, throttled | ~14 MS/s | 0/0 | no |
+| function | funcPlay (31) | funcPlayPattern (29) | funcPlay |
+| repeat | RepeatSet(1) | not set | RepeatSet(0) |
+| run | RunSet(duration) | not set | RunSet(0.0) |
+| feed size | exactly cFree | exactly cFree | host-side budget |
 
-The prime size is the only thing that tracks whether output appears; the feed
-rate does not, and `lost`/`corrupt` stayed at zero in every case, so the
-counters warn of nothing. `--stream-probe` does NOT settle this either: it
-measured how fast PlayData calls return, never that a sample reached W1, so
-its "63.4 MS/s, viable" verdict only bounds the API, not the signal path.
-Streaming is parked behind `--motion-stream` until this is diagnosed.
+Both prime with the DataInfo size and `continue` when cFree is 0. **Feeding
+more than cFree is an error** -- that, not a device limitation, was the
+"PlayData refused" seen in the streaming configurations on the first attempt.
+
+**The rate ceiling is FIFO depth / loop period.** A streaming configuration
+has about 32,768 samples of FIFO, which is only 2.29 ms of video at the colour
+rate, so the whole feed loop has to complete inside 2.29 ms. Against a 1413 us
+round trip:
+
+| loop structure | period | max rate | |
+|---|---|---|---|
+| Status + PlayStatus + PlayData | 4.24 ms | 7.73 MS/s | short |
+| PlayStatus + PlayData | 2.83 ms | 11.60 MS/s | short |
+| PlayData only, paced | 1.41 ms | 23.19 MS/s | enough |
+
+Measured was only 1.6-2.1 MS/s, well below even the three-call ceiling, so
+call count is not the whole story. `--feed-tune` sweeps loop structure against
+target rate in a streaming configuration and re-measures the round trip there,
+since 1413 us came from config 3.
 
 What works, and what `--motion` now does: put the whole animation in ONE
 DataSet and let run 0 / repeat 0 loop it in hardware -- the same mechanism
