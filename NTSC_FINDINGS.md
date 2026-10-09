@@ -254,6 +254,31 @@ only to about 2 MS/s on this unit. Audio does not need more.
 3. prime `DataInfo` samples (32768 = 2.29 ms at the colour rate)
 4. feed with `PlayData` only, sized from a clock-paced fill estimate
 5. poll `PlayStatus` every 100 ms for the counters, never for sizing
+6. generate the signal PER CHUNK, never per frame or per sequence
+
+**The 2.29 ms FIFO is the whole design constraint.** Everything the feed loop
+does between `PlayData` calls is spent against it, and two things that look
+harmless do not fit:
+
+| work | cost | share of a 2.29 ms FIFO |
+|---|---|---|
+| `FDwfAnalogOutStatus` | 1792 us | **78%** |
+| rebuilding a 953,400-sample sequence on wrap | 800 us | **35%** |
+| `FDwfAnalogOutNodePlayStatus` | 2 us | 0% |
+| generating one 32,768-sample chunk on demand | 22 us | **1%** |
+
+Adding the first two to a loop that had measured clean cost 2.3% of all
+samples, dropped in FIFO-sized chunks -- 32,768 lost per 100 ms poll, minimum
+fill -2.59 ms. That dropout rate breaks sync and rolls the picture. Note the
+rate itself was fine: measured -0.052%, a field rate of 59.9035 Hz against
+59.9401 nominal, which a CRT holds comfortably. **Rolling was the dropouts,
+not the timing.**
+
+So generate on demand: `fill_fn(dst, abs_pos, n)` writes n samples starting at
+an absolute sample index. Per chunk that is a 262 KB memmove plus a few short
+runs -- 22 us against 800 us for the same work done per sequence, and no stall
+concentrated at a wrap. Verified byte-identical to building whole sequences,
+including chunks that straddle a sequence boundary.
 
 What works, and what `--motion` now does: put the whole animation in ONE
 DataSet and let run 0 / repeat 0 loop it in hardware -- the same mechanism
