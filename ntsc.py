@@ -3302,6 +3302,19 @@ def feed_matrix(dwf, target=100e6 / 7):
     memory and saw exactly that. This measures it per configuration instead of
     trusting either the docstring or the success codes.
     """
+    # FDwfEnum populates the device list; FDwfEnumConfig indexes into it and
+    # fails with "Device index out of range" if this is skipped. Every other
+    # enumerator in this file does it first -- this one did not.
+    ndev = ctypes.c_int()
+    check(dwf, dwf.FDwfEnum(ctypes.c_int(0), ctypes.byref(ndev)), "FDwfEnum")
+    if ndev.value == 0:
+        raise RuntimeError("No Digilent device found. Close WaveForms and "
+                           "replug.")
+    name, sn = ctypes.create_string_buffer(32), ctypes.create_string_buffer(32)
+    dwf.FDwfEnumDeviceName(ctypes.c_int(0), name)
+    dwf.FDwfEnumSN(ctypes.c_int(0), sn)
+    print(f"  device 0: {name.value.decode()} {sn.value.decode()}")
+
     ncfg = ctypes.c_int()
     check(dwf, dwf.FDwfEnumConfig(ctypes.c_int(0), ctypes.byref(ncfg)),
           "FDwfEnumConfig")
