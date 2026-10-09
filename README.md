@@ -19,6 +19,9 @@ Verified against a **Leader LV5700A** waveform monitor / vectorscope and a CRT.
 # 75% EIA colour bars, 525-line interlaced — the good path
 python3 ntsc.py --deep --color --play-scale 1.0 --locked
 
+# a bouncing ball over the bars, looped from deep memory
+python3 ntsc.py --deep --color --play-scale 1.0 --locked --motion
+
 # monochrome bars, no setup needed
 python3 ntsc.py
 
@@ -98,6 +101,7 @@ values, and complements are exactly 180° apart. Luma is band-limited to
 | path | rate | samples/line | colour | host involvement |
 |---|---|---|---|---|
 | `--deep` | 14.286 MS/s | 908 | yes | **none after setup** |
+| `--deep --motion` | 14.286 MS/s | 908 | yes | **none at all** |
 | `--stream` | ~5.8 MS/s measured | ~370 | can't sustain it | continuous feed loop |
 | default (`funcCustom`) | 0.847 MS/s | 54 | no | none |
 
@@ -106,6 +110,42 @@ values, and complements are exactly 180° apart. Luma is band-limited to
 `--stream` feeds chunks via `PlayData` and is superseded for anything that
 fits in play memory. `funcCustom` loops a 32 Ki buffer in hardware, which is
 rock solid but caps samples-per-line.
+
+## Motion
+
+```bash
+# 4 s loop, ~1 screen-width/sec — the default
+python3 ntsc.py --deep --color --play-scale 1.0 --locked --motion
+
+# 9.4 s loop: slower, more natural motion, 1 GB of host RAM
+python3 ntsc.py --deep --color --play-scale 1.0 --locked --motion \
+                --motion-seconds 9.4
+```
+
+A white, luma-only ball bounces over the static bars. The whole animation goes
+into play memory in **one `DataSet`** and loops with run 0 / repeat 0 — the
+same mechanism `--deep` uses for a static picture — so the hardware loop *is*
+the animation and there is no host feed at all.
+
+Only the ball moves, so the static four-field background is built once and
+`memmove`'d per sequence with the ball painted over it as contiguous runs:
+6,271 samples of edit per 953,400, and 0.08 s to build all 60 sequences.
+
+| `--motion-seconds` | sequences | loop | host RAM | ball speed |
+|---|---|---|---|---|
+| 1.0 | 15 | 1.00 s | 114 MB | 4.00 w/s |
+| **4.0** (default) | 60 | 4.00 s | 458 MB | 1.00 w/s |
+| 9.4 | 140 | 9.34 s | 1068 MB | 0.43 w/s |
+
+**Loop length buys slower motion.** A seamless loop needs the content to close,
+not just the buffer: each four-field sequence already closes on 238,875 whole
+subcarrier cycles, but the ball must also complete a whole number of bounce
+cycles, and the x and y counts have to be coprime and distinct — equal counts
+put the axes in lockstep and the ball slides along one diagonal instead of
+bouncing. Rounding to whole cycles is what ties speed to loop length.
+
+`--motion-stream` selects an alternative path that appends with `PlayData`
+instead. **It has never produced output** — see Status.
 
 ## Measurement
 
@@ -197,3 +237,14 @@ anomaly remains: a single line per sequence at ~73% peak white, roughly 90%
 through the sequence. Sync width, line period and burst amplitude all scan
 clean. The subcarrier sits 250 Hz below nominal as a consequence of locking it
 to 227.5 × our line rate; `--fsc-nominal` trades that for SCH phase walking.
+
+`--motion` works: a bouncing ball loops out of deep memory with no host
+involvement.
+
+**Open: nothing streamed with `PlayData` has ever reached the output in
+config 3.** Across three runs the prime size was the only variable that
+predicted whether a picture appeared — a full `DataSet` displays, a
+32,768-sample `DataInfo` prefill followed by `PlayData` does not, at any feed
+rate, with `lost` and `corrupt` reporting zero throughout. `--stream-probe`
+does not settle it: it measures how fast `PlayData` calls return, not that a
+sample reached W1. Parked behind `--motion-stream`.
