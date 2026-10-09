@@ -175,22 +175,36 @@ unterminated stub — the usual cause of edge overshoot), not amplitude. Level i
 `--level`, and with the resistor fitted `--level` means the same thing at the
 load as it did without it.
 
-**A full DataSet with run 0 and repeat 0 LOOPS -- do not prime a stream with
-it.** This is the same call sequence in both paths and it means two different
-things depending on how much you preload:
+**OPEN: in config 3, only a full DataSet has ever reached the output.** Three
+runs, one variable:
 
-| prime | RunSet | RepeatSet | result |
+| prime | fed | lost/corrupt | reached a screen? |
 |---|---|---|---|
-| whole sequence | 0.0 | 0 | buffer **loops forever**, PlayData ignored |
-| DataInfo prefill (32768) | 0.0 | 0 | plays the prefill, then the PlayData stream |
+| DataSet 953,400 (whole sequence) | 0 | 0/0 | **YES** (looped sequence 0) |
+| DataSet 32,768 + PlayData | 36-44 MS/s | 0/0 | no |
+| DataSet 32,768 + PlayData, throttled | ~14 MS/s | 0/0 | no |
 
-`--deep` relies on the first row: it is how the static signal repeats with no
-host involvement. `--motion` needs the second. Priming the whole sequence and
-then streaming produced a ball that looped the first 66.7 ms forever -- and
-because t=0 put the ball at (r, r), that showed up as "a white ball stuck in
-the corner", not as an obvious freeze. Note `DataInfo` reports 32768 for every
-function in every configuration, so the prefill is only 2.3 ms; a `WaitSet` of
-about a second is what stops playback starving before the first PlayData lands.
+The prime size is the only thing that tracks whether output appears; the feed
+rate does not, and `lost`/`corrupt` stayed at zero in every case, so the
+counters warn of nothing. `--stream-probe` does NOT settle this either: it
+measured how fast PlayData calls return, never that a sample reached W1, so
+its "63.4 MS/s, viable" verdict only bounds the API, not the signal path.
+Streaming is parked behind `--motion-stream` until this is diagnosed.
+
+What works, and what `--motion` now does: put the whole animation in ONE
+DataSet and let run 0 / repeat 0 loop it in hardware -- the same mechanism
+`--deep` uses for a static picture. 140 four-field sequences fit in play
+memory (133,476,000 of 134,217,728 samples), which is 9.34 s at 1,068 MB of
+host doubles.
+
+A looping buffer is only seamless if the CONTENT closes too. Every four-field
+sequence already closes on a whole number of subcarrier cycles (238,875), so
+any whole number of them does; the ball does not, so its bounce must complete
+a whole number of cycles over the loop. The cycle counts must also be coprime
+and distinct -- equal counts put x and y in lockstep and the ball slides along
+one diagonal instead of bouncing. A short loop therefore forces fast motion:
+4.0 s gives 1.00 w/s, 9.34 s gives 0.428 w/s. That is the real trade, and
+memory is what buys slower motion.
 
 **`PlayStatus`'s `free` is writable space, not fill.** Feeding it directly is
 self-limiting: the buffer fills, then settles at the consumption rate. Do not

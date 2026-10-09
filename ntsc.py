@@ -2819,7 +2819,7 @@ def motion_geometry(spl, rate):
             "active_n": active_n, "total": fields * fhl * half}
 
 
-def ball_runs(geom, field, t, white, blank_v):
+def ball_runs(geom, field, t, white, blank_v, sx=None, sy=None):
     """The contiguous sample runs the ball covers in one field.
 
     `t` is elapsed seconds, derived from the real sample rate rather than the
@@ -2835,8 +2835,10 @@ def ball_runs(geom, field, t, white, blank_v):
     def bounce(v):
         v %= 2.0
         return v if v <= 1.0 else 2.0 - v
-    cx = r + (1.0 - 2 * r) * bounce(BALL_PHASE_X + BALL_SPEED_X * t)
-    cy = r + (1.0 - 2 * r) * bounce(BALL_PHASE_Y + BALL_SPEED_Y * t)
+    sx = BALL_SPEED_X if sx is None else sx
+    sy = BALL_SPEED_Y if sy is None else sy
+    cx = r + (1.0 - 2 * r) * bounce(BALL_PHASE_X + sx * t)
+    cy = r + (1.0 - 2 * r) * bounce(BALL_PHASE_Y + sy * t)
 
     out = []
     a0, an = geom["active0"], geom["active_n"]
@@ -2895,8 +2897,122 @@ def build_motion_background(spl, rate):
     return bg, total, amplitude, offset, norm(ball_v), norm(base), fsc
 
 
+MOTION_SECONDS = 4.0               # default --motion loop length
+
+
+def motion_loop_plan(rate, seq_samples, seconds, cap):
+    """Pick a loop length, and ball speeds that make the motion seamless.
+
+    Every four-field sequence closes on a whole number of subcarrier cycles
+    (238,875), so any whole number of them also closes -- the loop point is
+    already clean for the signal. The ball is not: it has to complete a whole
+    number of bounce cycles over the loop or it jumps at the seam. So the
+    requested speeds are rounded to the nearest whole-cycle count.
+    """
+    seq_t = seq_samples / rate
+    n = max(1, round(seconds / seq_t))
+    n = min(n, cap // seq_samples)
+    loop_t = n * seq_t
+    cyc_x = max(1, round(BALL_SPEED_X * loop_t / 2.0))
+    cyc_y = max(1, round(BALL_SPEED_Y * loop_t / 2.0))
+    # Equal cycle counts put x and y in lockstep and the ball traces a single
+    # diagonal line instead of bouncing; a common factor makes the path retrace
+    # itself partway through the loop. Nudge x until the pair is coprime and
+    # distinct. A short loop therefore forces faster motion -- that is the real
+    # trade, and --motion-seconds is how to buy slower motion with memory.
+    while cyc_x == cyc_y or math.gcd(cyc_x, cyc_y) != 1:
+        cyc_x += 1
+    return n, loop_t, 2.0 * cyc_x / loop_t, 2.0 * cyc_y / loop_t, cyc_x, cyc_y
+
+
 def start_motion(dwf, hdwf, ch, spl, rate, scale):
-    """Stream an endless bouncing ball over the colour bars from deep memory.
+    """A bouncing ball looped out of deep memory -- no host feed at all.
+
+    Uses the one configuration measured to actually reach the screen: the
+    whole buffer in a single DataSet with run 0 and repeat 0, which is how
+    --deep plays its static signal. The only difference here is that the
+    buffer holds many four-field sequences with the ball at a different
+    position in each, so the hardware loop IS the animation.
+    """
+    bg, total, amplitude, offset, ball_n, blank_n, fsc = \
+        build_motion_background(spl, rate)
+    geom = motion_geometry(spl, rate)
+    if geom["total"] != total:
+        raise RuntimeError(f"geometry/background disagree: "
+                           f"{geom['total']} vs {total}")
+    fields = geom["fields"]
+    field_s = total / fields / rate
+
+    pmin, pmax = ctypes.c_int(), ctypes.c_int()
+    check(dwf, dwf.FDwfAnalogOutNodePlayInfo(hdwf, ch, AnalogOutNodeCarrier,
+                                             ctypes.byref(pmin),
+                                             ctypes.byref(pmax)), "PlayInfo")
+    n, loop_t, sx, sy, cx_n, cy_n = motion_loop_plan(
+        rate, total, MOTION_SECONDS, pmax.value)
+    big_n = n * total
+    print(f"      loop {n} sequences = {big_n:,} samples, {loop_t:.3f} s "
+          f"({big_n / pmax.value * 100:.1f}% of play memory, "
+          f"{big_n * 8 / 1e6:.0f} MB on the host)")
+    print(f"      ball {cx_n} horizontal and {cy_n} vertical bounce cycles "
+          f"per loop -> {sx:.3f} w/s x {sy:.3f} h/s, seamless at the seam")
+
+    t0 = time.time()
+    big = (ctypes.c_double * big_n)()
+    for k in range(n):
+        ctypes.memmove(ctypes.byref(big, k * total * 8), bg, total * 8)
+        for f in range(fields):
+            t = (k * fields + f) * field_s
+            for idx, vals in ball_runs(geom, f, t, ball_n, blank_n, sx, sy):
+                a = k * total + idx
+                big[a:a + len(vals)] = vals
+    print(f"      built {n} sequences in {time.time() - t0:.2f} s")
+
+    check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
+    dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+    for fn_, a in ((dwf.FDwfAnalogOutNodeEnableSet, ctypes.c_int(1)),
+                   (dwf.FDwfAnalogOutNodeFunctionSet, funcPlay)):
+        check(dwf, fn_(hdwf, ch, AnalogOutNodeCarrier, a), "node setup")
+    scale_v = LEVEL * (2.0 if SOURCE_SERIES_75R else 1.0)
+    check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(rate / scale)),
+        "FrequencySet")
+    check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
+        hdwf, ch, AnalogOutNodeCarrier,
+        ctypes.c_double(amplitude * scale_v)), "AmplitudeSet")
+    check(dwf, dwf.FDwfAnalogOutNodeOffsetSet(
+        hdwf, ch, AnalogOutNodeCarrier,
+        ctypes.c_double(offset * scale_v)), "OffsetSet")
+    t0 = time.time()
+    check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+        hdwf, ch, AnalogOutNodeCarrier, big, ctypes.c_int(big_n)), "DataSet")
+    print(f"      uploaded {big_n * 8 / 1e6:.0f} MB in "
+          f"{time.time() - t0:.1f} s")
+    # Exactly what --deep does, and the only thing measured to reach a screen.
+    check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(0.0)),
+          "RunSet")
+    check(dwf, dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(0)),
+          "RepeatSet")
+    check(dwf, dwf.FDwfAnalogOutWaitSet(hdwf, ch, ctypes.c_double(0.0)),
+          "WaitSet")
+    check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
+          "Configure")
+    report_output_window(dwf, hdwf, ch, amplitude * scale_v, offset * scale_v)
+    print(f"\nLooping {loop_t:.3f} s of motion from deep memory, entirely in "
+          f"hardware. Press Ctrl+C to stop.")
+    return big_n
+
+
+def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
+    """Stream an endless bouncing ball by appending with PlayData.
+
+    UNVERIFIED: this path has never put a picture on a screen. It feeds at the
+    right rate with lost and corrupt both zero, and W1 stays dead. Priming the
+    whole sequence with DataSet displays; priming the 32768-sample DataInfo
+    prefill and streaming does not, and the prime size is the only variable
+    that tracks whether anything comes out. --stream-probe does not settle it
+    either: it measured how fast PlayData calls return, never that a sample
+    reached the output. Kept behind --motion-stream to finish diagnosing.
+    Use --motion, which loops a multi-sequence buffer out of deep memory.
 
     Primes play memory with one four-field sequence, then appends further
     sequences for as long as it runs. The feed holds a bounded in-flight
@@ -3207,6 +3323,7 @@ def main():
              # generation
              "--deep", "--stream", "--color", "--progressive", "--locked",
              "--run-infinite", "--series-75", "--max-res", "--motion",
+             "--motion-stream",
              # measurement
              "--dump", "--verify", "--analyze", "--scan", "--compare",
              "--capture",
@@ -3220,7 +3337,7 @@ def main():
             "--stream-rate", "--play-scale", "--config", "--sat",
             "--sys-clock", "--capture", "--seconds", "--level",
             "--burst-start", "--burst-amp", "--copies", "--setup",
-            "--bar-amp"}
+            "--bar-amp", "--motion-seconds"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -3252,7 +3369,7 @@ def main():
     global FILTER_CHROMA, STD_DC, FSC_NOMINAL, SYS_CLOCK, LOOP_ALIGN
     global VBI_BLACK, LEVEL, BURST_START_US, BURST_AMP
     global RUN_INFINITE, COPIES
-    global SOURCE_SERIES_75R
+    global SOURCE_SERIES_75R, MOTION_SECONDS
     # --locked: the combination measured to lock a Leader LV5700A through a
     # vectorscope-and-monitor chain. Individual flags still override it.
     if "--locked" in argv:
@@ -3269,6 +3386,9 @@ def main():
               f"at {BURST_START_US} us, infinite run")
     set_setup_ire(opt("--setup", float, SETUP_IRE))
     set_bar_amp(opt("--bar-amp", float, BAR_AMP * 100.0))
+    MOTION_SECONDS = opt("--motion-seconds", float, MOTION_SECONDS)
+    if MOTION_SECONDS <= 0:
+        raise RuntimeError("--motion-seconds must be positive.")
     VBI_BLACK = "--vbi-black" in argv
     LOOP_ALIGN = "--no-loop-align" not in argv
     SYS_CLOCK = opt("--sys-clock", float, None)
@@ -3290,6 +3410,9 @@ def main():
 
     if "--color" in argv and not ({"--deep", "--stream"} & set(argv)):
         raise RuntimeError("--color needs --deep (recommended) or --stream.")
+    if "--motion-stream" in argv and "--motion" not in argv:
+        raise RuntimeError("--motion-stream selects the feed path for "
+                           "--motion; pass --motion as well.")
     if "--motion" in argv:
         if "--deep" not in argv or "--color" not in argv:
             raise RuntimeError("--motion needs --deep --color: it streams a "
@@ -3384,7 +3507,18 @@ def main():
             print(f"      100 MHz/{div} exactly, line {line_hz:.2f} Hz "
                   f"({(line_hz / LINE_FREQ_HZ - 1) * 100:+.4f}%)")
             if "--motion" in argv:
-                total = start_motion(dwf, hdwf, ch, spl, rate, scale)
+                if "--motion-stream" in argv:
+                    print("NOTE: --motion-stream has never produced output on\n"
+                          "      this device. --motion alone loops deep memory,\n"
+                          "      which is the path measured to reach a screen.")
+                    start_motion_stream(dwf, hdwf, ch, spl, rate, scale)
+                else:
+                    start_motion(dwf, hdwf, ch, spl, rate, scale)
+                    try:
+                        while True:
+                            time.sleep(0.5)
+                    except KeyboardInterrupt:
+                        print("\nStopped.")
                 return
             total = start_deep(dwf, hdwf, ch, spl, rate, scale, fn,
                                colour="--color" in argv)
