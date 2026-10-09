@@ -2742,10 +2742,13 @@ def verify(dwf, hdwf, frame_hz, source="W1", groups_per_seq=None):
 # against the 14.286 MS/s colour rate, so unbounded streaming has ~3.2x of
 # headroom. Two things that measurement settled:
 #
-#  - PlayStatus reports the WHOLE 134 M play memory as free, not a small FIFO.
-#    Feeding everything free therefore buffers 9.4 seconds and then overruns;
-#    the 4 Mi chunk corrupted 211,200 samples doing exactly that. So the loop
-#    targets an in-flight depth instead of feeding all it can.
+#  - PlayStatus's `free` is the WRITABLE SPACE, not the fill. Feeding it
+#    directly is self-limiting: the buffer fills, then settles at the
+#    consumption rate. Deriving an in-flight depth as `cap - free` inverts
+#    that and feeds nothing at all -- which is how the first version of this
+#    shipped, and is the same mistake as the old `capacity - free` bug.
+#    Overrun is avoided by capping the chunk, not by gating on a depth: the
+#    4 Mi chunk corrupted 211,200 samples, 256 Ki none.
 #  - A round trip costs 1413 us, three per iteration, so chunks below ~59 Ki
 #    cannot keep up no matter how fast the host builds data.
 #
@@ -2761,7 +2764,21 @@ BALL_IRE = 100.0                   # luma-only ball; no chroma, so no phase
 BALL_EDGE_N = 3                    # samples of soft edge, each side
 PICTURE_ASPECT = 4.0 / 3.0
 FEED_CHUNK = 1 << 18               # 256 Ki: 46 MS/s measured, zero corruption
-FEED_WATERMARK_S = 0.5             # in-flight depth to hold, in seconds
+
+
+def feed_amount(free, remaining, chunk=FEED_CHUNK):
+    """How many samples to hand the device this iteration.
+
+    `free` is what PlayStatus reports WRITABLE -- not the fill. Feeding it
+    directly is self-limiting: the buffer fills, then settles at the
+    consumption rate. `remaining` is what is left of the current sequence.
+
+    Pure on purpose: the feed policy is the part that broke (an in-flight
+    depth derived as `cap - free` inverted the test and fed nothing), and a
+    policy that is a function can be simulated against a model device without
+    plugging anything in. See the simulation in the commit message.
+    """
+    return max(0, min(free, chunk, remaining))
 
 
 def motion_geometry(spl, rate):
@@ -2905,6 +2922,9 @@ def start_motion(dwf, hdwf, ch, spl, rate, scale):
           f"({painted:,} painted), budget {total / rate * 1000:.1f} ms "
           f"-> {t_build / (total / rate) * 100:.1f}% of real time")
 
+    # Reset first: the probe did and start_motion did not, and leftover
+    # state from the --deep setup is one fewer variable to wonder about.
+    check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
     dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
     for fn_, a in ((dwf.FDwfAnalogOutNodeEnableSet, ctypes.c_int(1)),
                    (dwf.FDwfAnalogOutNodeFunctionSet, funcPlay)):
@@ -2936,17 +2956,14 @@ def start_motion(dwf, hdwf, ch, spl, rate, scale):
           "Configure")
     report_output_window(dwf, hdwf, ch, amplitude * scale_v, offset * scale_v)
 
-    mark = int(FEED_WATERMARK_S * rate)
-    print(f"      play memory {cap:,} samples ({cap / rate:.2f} s); holding "
-          f"{mark:,} in flight ({FEED_WATERMARK_S:.2f} s, "
-          f"{mark * 8 / 1e6:.0f} MB), chunk {FEED_CHUNK:,}")
+    print(f"      play memory {cap:,} samples ({cap / rate:.2f} s); "
+          f"chunk {FEED_CHUNK:,} (measured clean at 46 MS/s)")
     print("\nStreaming motion. Press Ctrl+C to stop.")
 
     sts = ctypes.c_ubyte()
     free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
-    pos = total                      # primed sequence is already loaded
+    pos = total                      # the primed sequence is already loaded
     fed = iters = idle = 0
-    t_lost = t_corr = 0
     t0 = last = time.time()
     started = False
     try:
@@ -2957,55 +2974,61 @@ def start_motion(dwf, hdwf, ch, spl, rate, scale):
                 started = True
             elif started:
                 raise RuntimeError(f"AWG stopped (state {sts.value}) after "
-                                   f"{t_lost:,} lost, {t_corr:,} corrupted")
+                                   f"{lost.value:,} lost")
             check(dwf, dwf.FDwfAnalogOutNodePlayStatus(
                 hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
                 ctypes.byref(lost), ctypes.byref(corrupt)), "PlayStatus")
-            t_lost += lost.value
-            t_corr += corrupt.value
-            depth = max(0, cap - free.value)
             iters += 1
 
-            if depth < mark:
+            # Feed what PlayStatus reports writable, capped at the chunk size
+            # the probe measured clean. `free` is the WRITABLE SPACE, not the
+            # fill: deriving an in-flight depth as `cap - free` and gating on
+            # it inverts the test and feeds nothing at all. Feeding `free`
+            # directly is self-limiting -- it fills, then settles at the
+            # consumption rate -- and is what the shipped example does.
+            remaining = total - pos if pos < total else total
+            want = feed_amount(free.value, remaining)
+            if want > 0:
                 if pos >= total:
                     build_next()
                     pos = 0
-                want = min(FEED_CHUNK, total - pos, mark - depth, free.value)
-                if want > 0:
-                    check(dwf, dwf.FDwfAnalogOutNodePlayData(
-                        hdwf, ch, AnalogOutNodeCarrier,
-                        ctypes.byref(work, pos * 8), ctypes.c_int(want)),
-                        "PlayData")
-                    pos += want
-                    fed += want
-                    idle = 0
-                else:
-                    idle += 1
-            else:
+                check(dwf, dwf.FDwfAnalogOutNodePlayData(
+                    hdwf, ch, AnalogOutNodeCarrier,
+                    ctypes.byref(work, pos * 8), ctypes.c_int(want)),
+                    "PlayData")
+                pos += want
+                fed += want
                 idle = 0
+            else:
+                idle += 1
 
-            # Feeding nothing while the buffer is draining is the signature of
-            # a depth calculation that does not mean what it claims. Say so
-            # rather than starving silently.
-            if idle > 200:
+            # Must sit outside any feed condition: a guard that only runs on
+            # the path that feeds cannot fire when the bug is that we never
+            # feed. That is exactly how the inverted depth test shipped.
+            if started and idle > 500:
                 raise RuntimeError(
-                    f"fed nothing for {idle} iterations while depth "
-                    f"{depth:,} < watermark {mark:,} (free {free.value:,}, "
-                    f"cap {cap:,}). The depth estimate is wrong.")
+                    f"fed nothing for {idle} consecutive iterations while "
+                    f"running: PlayStatus reports free={free.value:,}, "
+                    f"lost={lost.value:,}. The AWG is starving.")
 
             now = time.time()
             if now - last >= 5.0:
                 el = now - t0
+                # Host-side estimate: what we have handed over, less what the
+                # device has had time to consume. Independent of the
+                # counters, whose exact semantics are not documented.
+                buf = max(0, total + fed - (now - t0) * rate)
                 print(f"  {el:6.1f} s  fed {fed / el / 1e6:6.3f} MS/s  "
-                      f"depth {depth / rate * 1000:6.1f} ms  "
+                      f"free {free.value:>11,}  buf~{buf / rate * 1000:6.0f} ms  "
                       f"seq {seq:,}  iters/s {iters / el:5.0f}  "
-                      f"lost {t_lost:,}  corrupt {t_corr:,}")
+                      f"lost {lost.value:,}  corrupt {corrupt.value:,}")
                 last = now
     except KeyboardInterrupt:
         el = time.time() - t0
         print(f"\nStopped after {el:.1f} s: {seq:,} sequences, "
-              f"{fed / 1e6:.1f} M samples fed at {fed / el / 1e6:.3f} MS/s, "
-              f"{t_lost:,} lost, {t_corr:,} corrupted")
+              f"{fed / 1e6:.1f} M samples fed at {fed / el / 1e6:.3f} MS/s "
+              f"(need {rate / 1e6:.3f}), last lost {lost.value:,}, "
+              f"corrupt {corrupt.value:,}")
     return total
 
 
