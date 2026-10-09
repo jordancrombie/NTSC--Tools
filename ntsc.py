@@ -2762,6 +2762,11 @@ BALL_SPEED_X = 0.42                # picture widths per second
 BALL_SPEED_Y = 0.31                # picture heights per second
 BALL_IRE = 100.0                   # luma-only ball; no chroma, so no phase
 BALL_EDGE_N = 3                    # samples of soft edge, each side
+# Start part-way along both ramps, so t=0 is mid-picture rather than hard in
+# the top-left corner. A ball parked at (r, r) is indistinguishable from a
+# ball that is not advancing at all, which cost a hardware round trip once.
+BALL_PHASE_X = 0.37
+BALL_PHASE_Y = 0.61
 PICTURE_ASPECT = 4.0 / 3.0
 FEED_CHUNK = 1 << 18               # 256 Ki: 46 MS/s measured, zero corruption
 
@@ -2822,8 +2827,8 @@ def ball_runs(geom, field, t, white, blank_v):
     def bounce(v):
         v %= 2.0
         return v if v <= 1.0 else 2.0 - v
-    cx = r + (1.0 - 2 * r) * bounce(BALL_SPEED_X * t)
-    cy = r + (1.0 - 2 * r) * bounce(BALL_SPEED_Y * t)
+    cx = r + (1.0 - 2 * r) * bounce(BALL_PHASE_X + BALL_SPEED_X * t)
+    cy = r + (1.0 - 2 * r) * bounce(BALL_PHASE_Y + BALL_SPEED_Y * t)
 
     out = []
     a0, an = geom["active0"], geom["active_n"]
@@ -2944,25 +2949,40 @@ def start_motion(dwf, hdwf, ch, spl, rate, scale):
     check(dwf, dwf.FDwfAnalogOutNodeOffsetSet(
         hdwf, ch, AnalogOutNodeCarrier,
         ctypes.c_double(offset * scale_v)), "OffsetSet")
-    check(dwf, dwf.FDwfAnalogOutNodeDataSet(
-        hdwf, ch, AnalogOutNodeCarrier, work, ctypes.c_int(total)), "DataSet")
     check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(0.0)),
           "RunSet")
     check(dwf, dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(0)),
           "RepeatSet")
-    check(dwf, dwf.FDwfAnalogOutWaitSet(hdwf, ch, ctypes.c_double(0.0)),
+    # Prefill the SMALL DataInfo buffer, not the whole sequence. A full
+    # DataSet with run 0 and repeat 0 is exactly how start_deep makes a static
+    # signal loop forever, so priming the whole sequence here makes the device
+    # repeat sequence 0 and ignore the stream -- which looks like a ball stuck
+    # in the corner, because t=0 puts it at (r, r) and one sequence is only
+    # 66.7 ms of travel. DataInfo reports 32768 for every function and
+    # configuration, so the wait is what keeps playback from starving before
+    # the first PlayData lands.
+    dmin, pre = ctypes.c_int(), ctypes.c_int()
+    check(dwf, dwf.FDwfAnalogOutNodeDataInfo(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(dmin),
+        ctypes.byref(pre)), "DataInfo")
+    n_pre = min(pre.value, total)
+    check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+        hdwf, ch, AnalogOutNodeCarrier, work, ctypes.c_int(n_pre)), "DataSet")
+    check(dwf, dwf.FDwfAnalogOutWaitSet(hdwf, ch,
+                                        ctypes.c_double(START_WAIT_S)),
           "WaitSet")
     check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
           "Configure")
     report_output_window(dwf, hdwf, ch, amplitude * scale_v, offset * scale_v)
 
     print(f"      play memory {cap:,} samples ({cap / rate:.2f} s); "
-          f"chunk {FEED_CHUNK:,} (measured clean at 46 MS/s)")
+          f"prefill {n_pre:,} ({n_pre / rate * 1000:.2f} ms), "
+          f"chunk {FEED_CHUNK:,}, wait {START_WAIT_S:.1f} s")
     print("\nStreaming motion. Press Ctrl+C to stop.")
 
     sts = ctypes.c_ubyte()
     free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
-    pos = total                      # the primed sequence is already loaded
+    pos = n_pre                      # carry on where the prefill stopped
     fed = iters = idle = 0
     t0 = last = time.time()
     started = False

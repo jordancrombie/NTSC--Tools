@@ -175,6 +175,32 @@ unterminated stub — the usual cause of edge overshoot), not amplitude. Level i
 `--level`, and with the resistor fitted `--level` means the same thing at the
 load as it did without it.
 
+**A full DataSet with run 0 and repeat 0 LOOPS -- do not prime a stream with
+it.** This is the same call sequence in both paths and it means two different
+things depending on how much you preload:
+
+| prime | RunSet | RepeatSet | result |
+|---|---|---|---|
+| whole sequence | 0.0 | 0 | buffer **loops forever**, PlayData ignored |
+| DataInfo prefill (32768) | 0.0 | 0 | plays the prefill, then the PlayData stream |
+
+`--deep` relies on the first row: it is how the static signal repeats with no
+host involvement. `--motion` needs the second. Priming the whole sequence and
+then streaming produced a ball that looped the first 66.7 ms forever -- and
+because t=0 put the ball at (r, r), that showed up as "a white ball stuck in
+the corner", not as an obvious freeze. Note `DataInfo` reports 32768 for every
+function in every configuration, so the prefill is only 2.3 ms; a `WaitSet` of
+about a second is what stops playback starving before the first PlayData lands.
+
+**`PlayStatus`'s `free` is writable space, not fill.** Feeding it directly is
+self-limiting: the buffer fills, then settles at the consumption rate. Do not
+derive an in-flight depth as `cap - free` and gate on it -- that inverts the
+test and feeds nothing. Bound overrun by capping the chunk instead (256 Ki
+measured clean, 4 Mi corrupted 211,200 samples). Observed values of `free` are
+not yet consistent between runs: `--stream-probe` saw it near the full 134 M
+after priming, while a full-sequence prime reported 890,585. A feed policy
+that only requires `free > 0` is immune to the difference.
+
 **OPEN: `--series-75` doubled the drive and the reading went DOWN.** Measured
 with a 75 ohm resistor fitted in series with W1, reading peak white off a flat
 100 IRE field (`--pattern white`) on the Leader:
