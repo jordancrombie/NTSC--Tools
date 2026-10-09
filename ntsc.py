@@ -2778,6 +2778,10 @@ FEED_PRELOAD_S = 0.5
 # --stream-rate-check: pay 1792 us per poll for a trustworthy `free` so the
 # device's real consumption rate can be computed. Underruns while it runs.
 STREAM_RATE_CHECK = False
+# --stream-capture <s>: seconds into a stream to take an interleaved scope
+# capture of our own output, then profile it. Acquisition is in hardware, so
+# only the final read stalls the feed -- after the samples are already taken.
+STREAM_CAPTURE_AT = None
 DWF_STATE_NAMES = {DwfStateArmed: "armed", DwfStateDone: "done",
                    DwfStateRunning: "running", DwfStateWait: "wait"}
 
@@ -3059,8 +3063,53 @@ def pick_stream_config(dwf, force=None):
     return best
 
 
+def stream_line_jitter(samples, dt_us, rate, spl):
+    """Line-to-line sync spacing from a capture -- the "sync slightly off" test.
+
+    Reports the distribution of intervals between successive horizontal sync
+    edges. A clean generator holds this to a few tens of nanoseconds. Gaps that
+    are an exact multiple of a chunk, or of a line, say something different
+    from gaps that are random.
+    """
+    srt = sorted(samples)
+    lo, hi = srt[len(srt) // 200], srt[-(len(srt) // 200) - 1]
+    runs = runs_below(samples, dt_us, lo + 0.13 * (hi - lo))
+    edges = [t for t, w in runs if 3.5 <= w <= 15]        # h-sync only
+    if len(edges) < 20:
+        print("  jitter: too few h-sync edges")
+        return
+    iv = [(edges[i + 1] - edges[i]) for i in range(len(edges) - 1)]
+    iv = [x for x in iv if x < 200.0]                     # drop VBI gaps
+    if not iv:
+        print("  jitter: no usable line intervals")
+        return
+    srt_iv = sorted(iv)
+    med = srt_iv[len(srt_iv) // 2]
+    nominal = spl / rate * 1e6 if spl else med
+    print(f"  line interval  median {med:.4f} us (built {nominal:.4f}), "
+          f"spread {srt_iv[0]:.4f}..{srt_iv[-1]:.4f} us over {len(iv)} lines")
+    print(f"                 p-p jitter {(srt_iv[-1] - srt_iv[0]) * 1000:.0f} ns, "
+          f"median error {(med - nominal) * 1000:+.0f} ns")
+    outliers = [(i, x) for i, x in enumerate(iv) if abs(x - med) > 0.100]
+    if not outliers:
+        print("                 no line more than 100 ns off the median")
+        return
+    print(f"                 {len(outliers)} of {len(iv)} lines more than "
+          f"100 ns off:")
+    for i, x in outliers[:8]:
+        print(f"                   line {i:4} {x:9.4f} us "
+              f"({(x - med) * 1000:+.0f} ns)")
+    if len(outliers) > 1:
+        gaps = [outliers[k + 1][0] - outliers[k][0]
+                for k in range(len(outliers) - 1)]
+        gs = sorted(gaps)
+        print(f"                 spacing between outliers: median "
+              f"{gs[len(gs) // 2]} lines, range {gs[0]}..{gs[-1]}")
+
+
 def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
-                rate_check=False, spl_hint=None):
+                rate_check=False, spl_hint=None, capture_at=None,
+                capture_path=None, capture_s=0.020, scope_rate=50e6):
     """Stream an arbitrary signal, generated on demand, paced against a clock.
 
     `fill_fn(dst, abs_pos, n)` writes n samples of the signal starting at
@@ -3098,6 +3147,13 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
     worst_fill = float("inf")
     actual = 0.0
     t_lost = t_corr = 0
+    # Interleaved capture: acquisition runs in device hardware, so arming it
+    # and polling costs almost nothing. Only the final read stalls the feed,
+    # and by then the samples are already taken -- so the capture reflects a
+    # healthy stream rather than one disturbed by its own measurement.
+    cap_n = int(capture_s * scope_rate) if capture_at is not None else 0
+    cap_state = "idle"
+    in_sts = ctypes.c_ubyte()
     try:
         while True:
             now = time.time() - t0
@@ -3130,6 +3186,46 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                         in_fifo = min(max(0, fifo - free.value), fifo)
                         actual = (fed - in_fifo) / now
                 t_poll = now + poll
+
+            if capture_at is not None and cap_state != "done":
+                if cap_state == "idle" and now >= capture_at:
+                    dwf.FDwfAnalogInFrequencySet(hdwf,
+                                                 ctypes.c_double(scope_rate))
+                    dwf.FDwfAnalogInBufferSizeSet(hdwf, ctypes.c_int(cap_n))
+                    dwf.FDwfAnalogInConfigure(hdwf, ctypes.c_int(1),
+                                              ctypes.c_int(1))
+                    print(f"  arming scope at {now:.1f} s: {cap_n:,} samples, "
+                          f"{capture_s * 1000:.1f} ms at "
+                          f"{scope_rate / 1e6:.0f} MS/s")
+                    cap_state = "armed"
+                elif cap_state == "armed" and now >= t_poll:
+                    dwf.FDwfAnalogInStatus(hdwf, ctypes.c_int(0),
+                                           ctypes.byref(in_sts))
+                    if in_sts.value == DwfStateDone:
+                        print(f"  acquired at {now:.1f} s "
+                              f"(lost {t_lost:,}, corrupt {t_corr:,} so far)")
+                        dwf.FDwfAnalogInStatus(hdwf, ctypes.c_int(1),
+                                               ctypes.byref(in_sts))
+                        buf = (ctypes.c_double * cap_n)()
+                        dwf.FDwfAnalogInStatusData(hdwf, ctypes.c_int(0), buf,
+                                                   ctypes.c_int(cap_n))
+                        samples = list(buf)
+                        cap_state = "done"
+                        if capture_path:
+                            with open(capture_path, "w") as f:
+                                f.write("t,v\n")
+                                for i, v in enumerate(samples):
+                                    f.write(f"{i / scope_rate:.9f},{v:.6f}\n")
+                            print(f"  wrote {capture_path}")
+                        # dt is in MICROSECONDS here (compare_captures
+                        # defaults to 0.020 for 50 MS/s), not seconds.
+                        dt_us = 1e6 / scope_rate
+                        prof = profile_capture(samples, dt_us)
+                        if prof is None:
+                            print("  profile: too few sync edges to measure")
+                        else:
+                            show_profile(prof, "streamed output")
+                        stream_line_jitter(samples, dt_us, rate, spl_hint)
 
             if now >= t_rep:
                 wf = (0.0 if worst_fill == float("inf")
@@ -3263,8 +3359,11 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
               "trustworthy `free`.\n"
               "      This WILL underrun and break the picture. Diagnostic only.")
     print("\nStreaming unbounded motion. Press Ctrl+C to stop.")
+    if STREAM_CAPTURE_AT is not None:
+        setup_scope(dwf, hdwf)
     stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo,
-                rate_check=STREAM_RATE_CHECK, spl_hint=spl)
+                rate_check=STREAM_RATE_CHECK, spl_hint=spl,
+                capture_at=STREAM_CAPTURE_AT, capture_path=SAVE_CAPTURE)
     return total
 
 
@@ -3768,7 +3867,7 @@ def main():
             "--stream-rate", "--play-scale", "--config", "--sat",
             "--sys-clock", "--capture", "--seconds", "--level",
             "--burst-start", "--burst-amp", "--copies", "--setup",
-            "--bar-amp", "--motion-seconds"}
+            "--bar-amp", "--motion-seconds", "--stream-capture"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -3801,6 +3900,7 @@ def main():
     global VBI_BLACK, LEVEL, BURST_START_US, BURST_AMP
     global RUN_INFINITE, COPIES
     global SOURCE_SERIES_75R, MOTION_SECONDS, STREAM_RATE_CHECK
+    global STREAM_CAPTURE_AT
     # --locked: the combination measured to lock a Leader LV5700A through a
     # vectorscope-and-monitor chain. Individual flags still override it.
     if "--locked" in argv:
@@ -3818,6 +3918,7 @@ def main():
     set_setup_ire(opt("--setup", float, SETUP_IRE))
     set_bar_amp(opt("--bar-amp", float, BAR_AMP * 100.0))
     STREAM_RATE_CHECK = "--stream-rate-check" in argv
+    STREAM_CAPTURE_AT = opt("--stream-capture", float, None)
     MOTION_SECONDS = opt("--motion-seconds", float, MOTION_SECONDS)
     if MOTION_SECONDS <= 0:
         raise RuntimeError("--motion-seconds must be positive.")
