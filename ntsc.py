@@ -3203,11 +3203,28 @@ FEED_PRIME_V = -0.5
 FEED_STREAM_V = +0.5
 
 
-def feed_one_config(dwf, cfg, target, secs=1.2, chunk=1 << 16, poll=0.1):
-    """Prime DC at one level, stream DC at another, report what reaches CH1.
+# The two streaming recipes the SDK actually ships, quoted so the diff from
+# them stays visible. Our code matched NEITHER: it used funcPlay with
+# RunSet(0.0) and RepeatSet(0), and fed a chunk sized by a host-side budget
+# rather than by cFree. Writing more than cFree is an error, which is what
+# "PlayData refused" was.
+#
+#   AnalogOut_Play.py      funcPlay(31), RepeatSet(1), RunSet(duration)
+#   AnalogOut_PlayTest.py  funcPlayPattern(29), run/repeat left at defaults
+#
+# Both prime with the DataInfo buffer size, then feed EXACTLY cFree each
+# iteration and `continue` when cFree is 0.
+FEED_RECIPES = (
+    ("play+rep1+run", "AnalogOut_Play.py: funcPlay, RepeatSet(1), RunSet(s)"),
+    ("pattern+free", "AnalogOut_PlayTest.py: funcPlayPattern, defaults"),
+)
 
-    Returns (verdict, measured_volts, fed_samples, seconds) or None if the
-    configuration cannot be opened. Needs W1 -> CH1.
+
+def feed_one_config(dwf, cfg, recipe, target, secs=1.2):
+    """One configuration, one recipe. Returns (verdict, volts, fed, elapsed).
+
+    Primes DC at FEED_PRIME_V and streams DC at FEED_STREAM_V, so the capture
+    says which is playing -- a success code cannot.
     """
     hdwf = ctypes.c_int()
     if dwf.FDwfDeviceConfigOpen(ctypes.c_int(0), ctypes.c_int(cfg),
@@ -3220,91 +3237,91 @@ def feed_one_config(dwf, cfg, target, secs=1.2, chunk=1 << 16, poll=0.1):
         dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
         dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
                                        ctypes.c_int(1))
-        dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier,
-                                         funcPlay)
+        fn = funcPlay if recipe == "play+rep1+run" else funcPlayPattern
+        dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier, fn)
         dwf.FDwfAnalogOutNodeFrequencySet(hdwf, ch, AnalogOutNodeCarrier,
                                           ctypes.c_double(target))
         dwf.FDwfAnalogOutNodeAmplitudeSet(hdwf, ch, AnalogOutNodeCarrier,
                                           ctypes.c_double(1.0))
-        dwf.FDwfAnalogOutNodeOffsetSet(hdwf, ch, AnalogOutNodeCarrier,
-                                       ctypes.c_double(0.0))
-        dmin, pre = ctypes.c_int(), ctypes.c_int()
-        dwf.FDwfAnalogOutNodeDataInfo(hdwf, ch, AnalogOutNodeCarrier,
-                                      ctypes.byref(dmin), ctypes.byref(pre))
-        n_pre = max(dmin.value, min(pre.value, 1 << 14))
+        if recipe == "play+rep1+run":
+            dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(1))
+            dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(secs + 2.0))
+        # else: run and repeat left at their defaults, as PlayTest does
+
+        cbuf = ctypes.c_int(0)
+        dwf.FDwfAnalogOutNodeDataInfo(hdwf, ch, AnalogOutNodeCarrier, 0,
+                                      ctypes.byref(cbuf))
+        n_pre = max(1, cbuf.value)
         primed = (ctypes.c_double * n_pre)()
         for i in range(n_pre):
             primed[i] = FEED_PRIME_V
         if dwf.FDwfAnalogOutNodeDataSet(hdwf, ch, AnalogOutNodeCarrier,
                                         primed, ctypes.c_int(n_pre)) != 1:
-            return ("DataSet refused", None, 0, 0.0)
-        dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(0.0))
-        dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(0))
-        dwf.FDwfAnalogOutWaitSet(hdwf, ch, ctypes.c_double(0.0))
+            return ("DataSet refused", None, 0, 0.0, n_pre, 0)
         if dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)) != 1:
-            return ("Configure refused", None, 0, 0.0)
+            return ("Configure refused", None, 0, 0.0, n_pre, 0)
 
-        src = (ctypes.c_double * chunk)()
-        for i in range(chunk):
+        SRC = 1 << 20
+        src = (ctypes.c_double * SRC)()
+        for i in range(SRC):
             src[i] = FEED_STREAM_V
         sts = ctypes.c_ubyte()
         free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
         fed = 0
+        t_lost = t_corr = 0
+        free_max = 0
+        note = ""
         t0 = time.time()
-        next_poll = 0.0
-        # Pace against the wall clock. Status is polled occasionally, not every
-        # iteration: with a 1413 us round trip, three calls per iteration caps
-        # the loop at ~236/s, and flow control does not need them -- the
-        # consumption rate is exactly the sample rate we set.
-        while True:
-            now = time.time() - t0
-            if now >= secs:
+        while time.time() - t0 < secs:
+            if dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts)) != 1:
+                note = "Status error"
                 break
-            if now >= next_poll:
-                dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts))
-                dwf.FDwfAnalogOutNodePlayStatus(
-                    hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
-                    ctypes.byref(lost), ctypes.byref(corrupt))
-                next_poll = now + poll
-            budget = int(now * target) + chunk - fed
-            if budget <= 0:
+            if sts.value != DwfStateRunning:
+                note = (f"left running ({DWF_STATE_NAMES.get(sts.value, sts.value)})")
+                break
+            dwf.FDwfAnalogOutNodePlayStatus(hdwf, ch, AnalogOutNodeCarrier,
+                                            ctypes.byref(free),
+                                            ctypes.byref(lost),
+                                            ctypes.byref(corrupt))
+            t_lost += lost.value
+            t_corr += corrupt.value
+            free_max = max(free_max, free.value)
+            if free.value == 0:
                 continue
-            n = min(chunk, budget)
-            if dwf.FDwfAnalogOutNodePlayData(
-                    hdwf, ch, AnalogOutNodeCarrier, src, ctypes.c_int(n)) != 1:
-                return ("PlayData refused", None, fed, time.time() - t0)
+            # Exactly cFree, clamped to our source buffer -- as both examples
+            # do. Feeding more than cFree is an error.
+            n = min(free.value, SRC)
+            if dwf.FDwfAnalogOutNodePlayData(hdwf, ch, AnalogOutNodeCarrier,
+                                             src, ctypes.c_int(n)) != 1:
+                note = "PlayData refused"
+                break
             fed += n
         el = time.time() - t0
 
-        # What is actually on the wire?
         s = capture(dwf, hdwf, 1e6, 1 << 13)
         v = sorted(s)[len(s) // 2]
         if abs(v - FEED_STREAM_V) < 0.15:
-            verdict = "STREAM reaches output"
+            verdict = "STREAM on output"
         elif abs(v - FEED_PRIME_V) < 0.15:
-            verdict = "looping the prime"
+            verdict = "looping prime"
         elif abs(v) < 0.1:
             verdict = "W1 dead"
         else:
-            verdict = f"unexpected {v:+.3f} V"
-        return (verdict, v, fed, el)
+            verdict = f"odd {v:+.2f} V"
+        if note:
+            verdict += f" [{note}]"
+        return (verdict, v, fed, el, n_pre, free_max, t_lost, t_corr)
     finally:
         dwf.FDwfDeviceClose(hdwf)
 
 
 def feed_matrix(dwf, target=100e6 / 7):
-    """Which configurations actually emit PlayData? Needs W1 -> CH1.
+    """Configuration x recipe: which combination puts a stream on W1?
 
-    pick_config's docstring claims only configurations reporting
-    DECIAnalogOutPlaySize == 0 drive the output, and that those advertising a
-    67 M or 134 M play FIFO accept data at the correct rate with zero lost or
-    corrupted samples while leaving W1 parked. --motion used the deepest play
-    memory and saw exactly that. This measures it per configuration instead of
-    trusting either the docstring or the success codes.
+    Needs W1 -> CH1. The question this answers is the one that blocks feeding
+    arbitrary data: does PlayData reach the output, under the call sequences
+    the SDK's own examples use, and at what rate.
     """
-    # FDwfEnum populates the device list; FDwfEnumConfig indexes into it and
-    # fails with "Device index out of range" if this is skipped. Every other
-    # enumerator in this file does it first -- this one did not.
     ndev = ctypes.c_int()
     check(dwf, dwf.FDwfEnum(ctypes.c_int(0), ctypes.byref(ndev)), "FDwfEnum")
     if ndev.value == 0:
@@ -3314,39 +3331,46 @@ def feed_matrix(dwf, target=100e6 / 7):
     dwf.FDwfEnumDeviceName(ctypes.c_int(0), name)
     dwf.FDwfEnumSN(ctypes.c_int(0), sn)
     print(f"  device 0: {name.value.decode()} {sn.value.decode()}")
-
     ncfg = ctypes.c_int()
     check(dwf, dwf.FDwfEnumConfig(ctypes.c_int(0), ctypes.byref(ncfg)),
           "FDwfEnumConfig")
+
     print(f"\nFeed matrix: prime DC {FEED_PRIME_V:+.2f} V, stream DC "
-          f"{FEED_STREAM_V:+.2f} V at {target / 1e6:.3f} MS/s (needs W1 -> CH1)")
-    print(f"\n  {'cfg':>3} {'play mem':>12} {'fed MS/s':>9} {'CH1':>8}  verdict")
+          f"{FEED_STREAM_V:+.2f} V at {target / 1e6:.3f} MS/s. "
+          f"Needs W1 -> CH1.")
+    for key, desc in FEED_RECIPES:
+        print(f"  {key:16} {desc}")
     good = []
-    for i in range(ncfg.value):
-        play = ctypes.c_int()
-        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogOutPlaySize,
-                               ctypes.byref(play))
-        r = feed_one_config(dwf, i, target)
-        if r is None:
-            print(f"  {i:>3} {play.value:>12,} {'':>9} {'':>8}  could not open")
-            continue
-        verdict, v, fed, el = r
-        rate_s = f"{fed / el / 1e6:9.3f}" if el > 0 else f"{'':>9}"
-        v_s = f"{v:+8.3f}" if v is not None else f"{'':>8}"
-        print(f"  {i:>3} {play.value:>12,} {rate_s} {v_s}  {verdict}")
-        if verdict.startswith("STREAM"):
-            good.append((i, fed / el / 1e6, play.value))
+    for key, _ in FEED_RECIPES:
+        print(f"\n  recipe {key}")
+        print(f"    {'cfg':>3} {'play mem':>12} {'prefill':>8} {'free max':>10} "
+              f"{'MS/s':>8} {'CH1':>7}  verdict")
+        for i in range(ncfg.value):
+            play = ctypes.c_int()
+            dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogOutPlaySize,
+                                   ctypes.byref(play))
+            r = feed_one_config(dwf, i, key, target)
+            if r is None:
+                print(f"    {i:>3} {play.value:>12,} "
+                      f"{'':>8} {'':>10} {'':>8} {'':>7}  could not open")
+                continue
+            verdict, v, fed, el, n_pre, fmax = r[0], r[1], r[2], r[3], r[4], r[5]
+            ms = f"{fed / el / 1e6:8.3f}" if el > 0 else f"{'':>8}"
+            vs = f"{v:+7.3f}" if v is not None else f"{'':>7}"
+            print(f"    {i:>3} {play.value:>12,} {n_pre:>8,} {fmax:>10,} "
+                  f"{ms} {vs}  {verdict}")
+            if verdict.startswith("STREAM"):
+                good.append((key, i, fed / el / 1e6))
     print()
     if not good:
-        print("  No configuration emitted the streamed data. Streaming an")
-        print("  arbitrary signal is not possible on this unit via PlayData.")
+        print("  Nothing streamed reached W1 under either documented recipe.")
         return good
-    print(f"  Configurations that emit: {', '.join(str(i) for i, _, _ in good)}")
-    for i, ms, play in good:
+    print("  Combinations that put the stream on the output:")
+    for key, i, ms in good:
         head = ms / (target / 1e6)
-        print(f"    config {i}: {ms:.3f} MS/s fed, {head:.2f}x the "
+        print(f"    {key} config {i}: {ms:.3f} MS/s = {head:.2f}x the "
               f"{target / 1e6:.3f} MS/s colour rate"
-              + ("" if head >= 1.0 else " -- NOT ENOUGH for colour"))
+              + ("" if head >= 1.0 else "  -- short for colour"))
     return good
 
 
