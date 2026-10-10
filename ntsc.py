@@ -2782,6 +2782,15 @@ STREAM_RATE_CHECK = False
 # capture of our own output, then profile it. Acquisition is in hardware, so
 # only the final read stalls the feed -- after the samples are already taken.
 STREAM_CAPTURE_AT = None
+# Which documented streaming recipe to use. --feed-matrix proved both put data
+# on the output, but it streamed DC, which cannot reveal a wrong sample rate.
+# "pattern" is AnalogOut_PlayTest.py (funcPlayPattern, run/repeat default) and
+# is what continuous streaming is meant to use; "play" is AnalogOut_Play.py
+# (funcPlay, RepeatSet(1), a finite run) and is the function --deep uses, which
+# plays our content perfectly. If the picture rolls on one and not the other,
+# the function is the variable.
+STREAM_FUNC = "pattern"
+STREAM_RUN_S = 3600.0              # "play" needs a finite run length
 DWF_STATE_NAMES = {DwfStateArmed: "armed", DwfStateDone: "done",
                    DwfStateRunning: "running", DwfStateWait: "wait"}
 
@@ -3429,11 +3438,27 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
     dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
     check(dwf, dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
                                               ctypes.c_int(1)), "NodeEnableSet")
-    # funcPlayPattern with run and repeat at their defaults, as
-    # AnalogOut_PlayTest.py does for continuous streaming.
-    check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier,
-                                                funcPlayPattern),
-          "NodeFunctionSet")
+    if STREAM_FUNC == "play":
+        # AnalogOut_Play.py: funcPlay, repeat 1, a finite run. Unbounded is
+        # approximated with a long run length.
+        check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(
+            hdwf, ch, AnalogOutNodeCarrier, funcPlay), "NodeFunctionSet")
+        check(dwf, dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(1)),
+              "RepeatSet")
+        check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch,
+                                           ctypes.c_double(STREAM_RUN_S)),
+              "RunSet")
+    else:
+        # AnalogOut_PlayTest.py: funcPlayPattern, run and repeat at defaults.
+        check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(
+            hdwf, ch, AnalogOutNodeCarrier, funcPlayPattern),
+            "NodeFunctionSet")
+    print(f"      streaming recipe {STREAM_FUNC!r}: "
+          + ("funcPlay, RepeatSet(1), RunSet("
+             f"{STREAM_RUN_S:.0f} s) -- AnalogOut_Play.py"
+             if STREAM_FUNC == "play"
+             else "funcPlayPattern, run/repeat default "
+                  "-- AnalogOut_PlayTest.py"))
     check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
         hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(rate / scale)),
         "FrequencySet")
@@ -3975,7 +4000,8 @@ def main():
             "--stream-rate", "--play-scale", "--config", "--sat",
             "--sys-clock", "--capture", "--seconds", "--level",
             "--burst-start", "--burst-amp", "--copies", "--setup",
-            "--bar-amp", "--motion-seconds", "--stream-capture"}
+            "--bar-amp", "--motion-seconds", "--stream-capture",
+            "--stream-func"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -4008,7 +4034,7 @@ def main():
     global VBI_BLACK, LEVEL, BURST_START_US, BURST_AMP
     global RUN_INFINITE, COPIES
     global SOURCE_SERIES_75R, MOTION_SECONDS, STREAM_RATE_CHECK
-    global STREAM_CAPTURE_AT
+    global STREAM_CAPTURE_AT, STREAM_FUNC
     # --locked: the combination measured to lock a Leader LV5700A through a
     # vectorscope-and-monitor chain. Individual flags still override it.
     if "--locked" in argv:
@@ -4027,6 +4053,9 @@ def main():
     set_bar_amp(opt("--bar-amp", float, BAR_AMP * 100.0))
     STREAM_RATE_CHECK = "--stream-rate-check" in argv
     STREAM_CAPTURE_AT = opt("--stream-capture", float, None)
+    STREAM_FUNC = opt("--stream-func", str, STREAM_FUNC)
+    if STREAM_FUNC not in ("play", "pattern"):
+        raise RuntimeError("--stream-func must be 'play' or 'pattern'.")
     MOTION_SECONDS = opt("--motion-seconds", float, MOTION_SECONDS)
     if MOTION_SECONDS <= 0:
         raise RuntimeError("--motion-seconds must be positive.")
