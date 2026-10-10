@@ -3106,6 +3106,34 @@ def pick_stream_config(dwf, force=None):
     return best
 
 
+def check_chain_gain(prof, expect_sync_v):
+    """Warn when the captured sync depth does not track what we are driving.
+
+    A passive chain has a fixed gain, so measured sync depth must scale with
+    the output level. If it does not, something between W1 and the scope is
+    REGENERATING the signal -- a time base corrector does exactly that -- and
+    the capture then describes that device's output, not ours. Two runs an
+    output level of 1.87x apart both measured 534.8 and 534.7 mV of sync
+    depth, which is how this was eventually noticed; it should have been
+    flagged the first time.
+    """
+    if not expect_sync_v:
+        return
+    got = prof.get("sync_mv")
+    if not got:
+        return
+    want = expect_sync_v * 1000.0
+    ratio = got / want
+    print(f"  chain gain  driving {want:.1f} mV of sync at W1, measured "
+          f"{got:.1f} mV -> {ratio:.3f}x")
+    if not 0.2 < ratio < 5.0:
+        print("  WARNING: implausible chain gain. Check the probe point.")
+    print("  NOTE: if this ratio changes when --level changes, the chain is "
+          "not\n        passive -- something is regenerating sync, and this "
+          "capture\n        describes ITS output rather than ours. Tap W1 "
+          "directly.")
+
+
 def describe_capture(samples, dt_us):
     """Say what a capture actually contains when no sync was found.
 
@@ -3192,7 +3220,8 @@ def stream_line_jitter(samples, dt_us, rate, spl):
 
 def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                 rate_check=False, spl_hint=None, capture_at=None,
-                capture_path=None, capture_s=0.040, scope_rate=50e6):
+                capture_path=None, capture_s=0.040, scope_rate=50e6,
+                expect_sync_v=None):
     """Stream an arbitrary signal, generated on demand, paced against a clock.
 
     `fill_fn(dst, abs_pos, n)` writes n samples of the signal starting at
@@ -3400,6 +3429,7 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                             describe_capture(samples, dt_us)
                         else:
                             show_profile(prof, "streamed output")
+                            check_chain_gain(prof, expect_sync_v)
                         stream_line_jitter(samples, dt_us, rate, spl_hint)
                         # Reading a large buffer stalls the loop, so the
                         # clock-paced estimate is stale afterwards. Re-baseline
@@ -3592,7 +3622,8 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
     stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo,
                 rate_check=STREAM_RATE_CHECK, spl_hint=spl,
                 capture_at=STREAM_CAPTURE_AT, capture_path=SAVE_CAPTURE,
-                capture_s=STREAM_CAPTURE_S)
+                capture_s=STREAM_CAPTURE_S,
+                expect_sync_v=(V_BLANK - V_SYNC) * scale_v)
     return total
 
 
