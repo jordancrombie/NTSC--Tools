@@ -53,6 +53,7 @@ Run with --help for the full flag list.
 """
 
 import ctypes
+import gc
 import math
 import sys
 import time
@@ -69,6 +70,7 @@ DECIAnalogOutChannelCount = ctypes.c_int(2)
 DECIDigitalOutBufferSize = ctypes.c_int(10)
 DECIAnalogOutPlaySize = ctypes.c_int(13)
 funcPlay = ctypes.c_int(31)
+funcSquare = ctypes.c_int(2)       # hardware-generated, no host, no memory
 funcPlayPattern = ctypes.c_int(29)
 funcCustomPattern = ctypes.c_int(28)
 DwfDigitalOutTypeCustom = ctypes.c_int(1)
@@ -771,30 +773,53 @@ START_WAIT_S = 1.0
 PLAY_SCALE_OVERRIDE = None
 
 
-def choose_stream_timing(max_rate):
+# Minimum samples per subcarrier cycle for colour. Picking purely on
+# line-rate accuracy once chose divider 14 -- 454 samples/line and 1.996
+# samples per cycle, exactly Nyquist -- which silently collapsed the chroma
+# peak from +102.5 to +94.66 IRE. Above about 3 the reconstruction holds.
+MIN_SAMPLES_PER_SC = 3.0
+
+
+def choose_stream_timing(max_rate, colour=False, force_div=None):
     """Integer divider of the AWG clock with the most accurate line rate.
 
     Same divider constraint as funcCustom -- the rate must be AWG_CLOCK_HZ/N
     or the hardware stalls whole samples -- but without the buffer ceiling,
     so N can be small and samples-per-line large.
+
+    For colour the rate must also carry the subcarrier: fsc is 227.5 x the
+    line rate, so a divider that leaves fewer than MIN_SAMPLES_PER_SC samples
+    per cycle is rejected however good its line rate looks.
     """
     best = None
     max_rate = min(max_rate, STREAM_MAX_RATE)
-    for n in range(2, 40):
+    # Selecting on line-rate accuracy alone cannot express the real trade:
+    # a smaller divider samples the subcarrier better, a larger one needs less
+    # throughput. --stream-div names the divider directly.
+    span = (force_div, force_div + 1) if force_div else (2, 40)
+    for n in range(*span):
         rate = AWG_CLOCK_HZ / n
-        if rate > max_rate:
+        if rate > max_rate and not force_div:
             continue
         spl = round(rate / LINE_FREQ_HZ)
         spl += spl % 2                      # even: interlace needs half-lines
         if spl < 120:              # still far better than funcCustom's 54
             continue
         line_hz = rate / spl
+        if (colour and not force_div
+                and rate / (SC_RATIO * line_hz) < MIN_SAMPLES_PER_SC):
+            continue
         err = abs(line_hz / LINE_FREQ_HZ - 1)
         key = (round(err, 9), -spl)
         if best is None or key < best[0]:
             best = (key, n, spl, rate, line_hz)
     if best is None:
-        raise RuntimeError("No usable streaming divider.")
+        raise RuntimeError(
+            f"No usable streaming divider at or below "
+            f"{max_rate / 1e6:.3f} MS/s"
+            + (f" with at least {MIN_SAMPLES_PER_SC} samples per subcarrier "
+               f"cycle. Raise --stream-rate." if colour else
+               ". Raise --stream-rate."))
     _, n, spl, rate, line_hz = best
     return n, spl, rate, line_hz
 
@@ -1415,7 +1440,9 @@ def calibrate_play_rate(dwf, hdwf, ch, func, requested=2e6):
     lo, hi = min(samples), max(samples)
     if hi - lo < 0.5:
         raise RuntimeError(f"Calibration saw no square wave on CH1 "
-                           f"({lo:+.3f}..{hi:+.3f} V). Jumper W1 to CH1.")
+                           f"({lo:+.3f}..{hi:+.3f} V). Jumper W1 to CH1, "
+                           f"or pass --play-scale 1.0 to skip calibration "
+                           f"(measured correct for this device).")
     mid = (lo + hi) / 2.0
     edges = [(i - 1 + (mid - samples[i - 1]) / (samples[i] - samples[i - 1])) * dt
              for i in range(1, len(samples))
@@ -2735,6 +2762,2346 @@ def verify(dwf, hdwf, frame_hz, source="W1", groups_per_seq=None):
                 print(f"  >> {unit} length matches the uploaded buffer.")
 
 
+# ----------------------------------------------------------------------------
+# Motion (--motion): a bouncing ball over the static colour bars.
+#
+# Measured with --stream-probe: PlayData sustains 46 MS/s at a 256 Ki chunk
+# against the 14.286 MS/s colour rate, so unbounded streaming has ~3.2x of
+# headroom. Two things that measurement settled:
+#
+#  - PlayStatus's `free` is the WRITABLE SPACE, not the fill. Feeding it
+#    directly is self-limiting: the buffer fills, then settles at the
+#    consumption rate. Deriving an in-flight depth as `cap - free` inverts
+#    that and feeds nothing at all -- which is how the first version of this
+#    shipped, and is the same mistake as the old `capacity - free` bug.
+#    Overrun is avoided by capping the chunk, not by gating on a depth: the
+#    4 Mi chunk corrupted 211,200 samples, 256 Ki none.
+#  - A round trip costs 1413 us, three per iteration, so chunks below ~59 Ki
+#    cannot keep up no matter how fast the host builds data.
+#
+# Only the ball moves, so the static four-field background is built once and
+# memmove'd into a work buffer per sequence; the ball is then painted over it
+# as a handful of contiguous runs. That is ~8000 samples of edit per 953,400,
+# which is why this needs no C extension.
+# ----------------------------------------------------------------------------
+BALL_DIA = 0.12                    # diameter, as a fraction of picture height
+BALL_SPEED_X = 0.42                # picture widths per second
+BALL_SPEED_Y = 0.31                # picture heights per second
+BALL_IRE = 100.0                   # luma-only ball; no chroma, so no phase
+BALL_EDGE_N = 3                    # samples of soft edge, each side
+# Start part-way along both ramps, so t=0 is mid-picture rather than hard in
+# the top-left corner. A ball parked at (r, r) is indistinguishable from a
+# ball that is not advancing at all, which cost a hardware round trip once.
+BALL_PHASE_X = 0.37
+BALL_PHASE_Y = 0.61
+PICTURE_ASPECT = 4.0 / 3.0
+FEED_CHUNK = 1 << 18               # 256 Ki: 46 MS/s measured, zero corruption
+# How far ahead of the playhead to keep the device. The feed is throttled
+# against the wall clock, not against `free`: the consumption rate is exactly
+# the sample rate we set, so cumulative fed <= elapsed * rate + this is a hard
+# bound on in-flight depth. Feeding `free` instead ran 3.08x too fast and put
+# 760 M samples nowhere, with lost and corrupt both still reporting zero.
+FEED_PRELOAD_S = 0.5
+# --stream-rate-check: pay 1792 us per poll for a trustworthy `free` so the
+# device's real consumption rate can be computed. Underruns while it runs.
+STREAM_RATE_CHECK = False
+# --stream-capture <s>: seconds into a stream to take an interleaved scope
+# capture of our own output, then profile it. Acquisition is in hardware, so
+# only the final read stalls the feed -- after the samples are already taken.
+STREAM_CAPTURE_AT = None
+# Which documented streaming recipe to use. --feed-matrix proved both put data
+# on the output, but it streamed DC, which cannot reveal a wrong sample rate.
+# "pattern" is AnalogOut_PlayTest.py (funcPlayPattern, run/repeat default) and
+# is what continuous streaming is meant to use; "play" is AnalogOut_Play.py
+# (funcPlay, RepeatSet(1), a finite run) and is the function --deep uses, which
+# plays our content perfectly. If the picture rolls on one and not the other,
+# the function is the variable.
+STREAM_FUNC = "pattern"
+STREAM_RUN_S = 3600.0              # "play" needs a finite run length
+# --stream-static: stream the static bars with NO ball, so the content is
+# identical to what --deep plays perfectly. That reduces the difference between
+# "perfect" and "rolling" to delivery alone -- chunked PlayData in config 5
+# versus one DataSet in config 3 -- with content held constant.
+STREAM_STATIC = False
+# --stream-align G: quantise every PlayData to a multiple of G samples. We
+# currently send a continuously varying count, and --feed-matrix could not have
+# noticed per-chunk padding or alignment because it streamed DC. 908 is one
+# line; AnalogIn reports a buffer granularity of 16.
+STREAM_ALIGN = 1
+# Pacing against an assumed rate is OPEN LOOP and cannot hold: the device runs
+# 0.05% slow, so the fill estimate falls ~0.54 ms behind every second, and
+# after ~4 s we write into a FIFO we believe is empty and is actually full.
+# The device then drops samples silently -- level corruption, with lost and
+# corrupt reporting nothing. Two things close the loop:
+#   GUARD     headroom kept free, >= the worst drift between resyncs, so an
+#             optimistic estimate still cannot overfill.
+#   RESYNC_S  how often to pay 1792 us for a TRUE `free`, then refill by
+#             exactly that much and reset the estimate.
+# Both default OFF. They were added on a theory that the feed was overfeeding
+# into a full FIFO, and the measurement refuted it: with GUARD 16384 and a 1 s
+# resync the drift came back at -200 ms (starving, not overfeeding) and lost
+# went from 0 to 7.7 billion. Halving the target fill halves the samples per
+# PlayData call, and throughput per iteration is call-bound, so the guard
+# simply starved the device. Without them the feed is clean -- 14.29 MS/s,
+# lost 0, corrupt 0, for 26 s. Kept as knobs, not as defaults.
+STREAM_GUARD = 0
+STREAM_RESYNC_S = 0.0              # 0 disables the resync entirely
+# --stream-capture-s: acquisition window. Must exceed one field (16.7 ms) to
+# contain a vertical interval, which is what a rolling picture is about.
+STREAM_CAPTURE_S = 0.040
+# --stream-square N: stream a square wave toggling every N samples instead of
+# video, and measure its half-periods in samples. The only test that can say
+# whether the device delivers our samples faithfully.
+STREAM_SQUARE = 0
+# --stream-doc: the SDK's documented feed loop verbatim -- AnalogOutStatus,
+# then PlayStatus, then PlayData of exactly `free` -- with no clock pacing.
+# Measured cost per pass is 2470 us (1393 for AnalogOutStatus, 1077 for
+# PlayData, which is FLAT regardless of size), so it only fits where the FIFO
+# holds more than that: 12.5 MS/s and below. At 14.286 the FIFO is 2294 us and
+# the loop structurally cannot keep up -- that is the real reason the colour
+# rate fails. Below the ceiling `free` is always valid, so there is no
+# estimate to drift and nothing to overfeed.
+STREAM_DOC = False
+# --stream-pad N / --stream-pad-every M: insert N padding samples every M real
+# samples, so the 32-sample block the FIFO discards on each wrap is padding
+# instead of picture. Defaults match the measured defect: 32 every 32,768.
+STREAM_PAD = 0
+STREAM_PAD_EVERY = 32768
+DWF_STATE_NAMES = {DwfStateArmed: "armed", DwfStateDone: "done",
+                   DwfStateRunning: "running", DwfStateWait: "wait"}
+
+
+def feed_amount(free, remaining, chunk=FEED_CHUNK):
+    """How many samples to hand the device this iteration.
+
+    `free` is what PlayStatus reports WRITABLE -- not the fill. Feeding it
+    directly is self-limiting: the buffer fills, then settles at the
+    consumption rate. `remaining` is what is left of the current sequence.
+
+    Pure on purpose: the feed policy is the part that broke (an in-flight
+    depth derived as `cap - free` inverted the test and fed nothing), and a
+    policy that is a function can be simulated against a model device without
+    plugging anything in. See the simulation in the commit message.
+    """
+    return max(0, min(free, chunk, remaining))
+
+
+def motion_geometry(spl, rate):
+    """Where every active picture line starts, grouped by field.
+
+    Mirrors build_colour_volts' layout exactly: lines sit on even half-lines,
+    line hl starting at sample hl * (spl // 2), with each field's first 18
+    half-lines overwritten by the pulse train and the next EXTRA_BLANK_LINES
+    lines blanked.
+    """
+    us = 1e6 / rate
+    half = spl // 2
+    fields, fhl = colour_fields()
+    sync_n = round(H_SYNC_US / us)
+    bp_n = round(BACK_PORCH_US / us)
+    fp_n = round(FRONT_PORCH_US / us)
+    active_n = spl - sync_n - bp_n - fp_n
+    rows = []
+    for f in range(fields):
+        base = f * fhl
+        first = base + (18 if base % 2 == 0 else 19)
+        start = first + 2 * EXTRA_BLANK_LINES
+        rows.append([hl * half for hl in range(start, base + fhl, 2)])
+    return {"fields": fields, "rows": rows, "active0": sync_n + bp_n,
+            "active_n": active_n, "total": fields * fhl * half}
+
+
+def ball_runs(geom, field, t, white, blank_v, sx=None, sy=None):
+    """The contiguous sample runs the ball covers in one field.
+
+    `t` is elapsed seconds, derived from the real sample rate rather than the
+    nominal field rate. Returns (start_index, values) pairs. The ball is luma
+    only, so its samples are a flat level with a short raised-cosine edge and
+    carry no subcarrier term -- which is what lets them be painted over a
+    background at any subcarrier phase without a discontinuity.
+    """
+    rows = geom["rows"][field]
+    n = len(rows)
+    r = BALL_DIA / 2.0
+    # Bounce by reflecting a linear ramp: no state to drift.
+    def bounce(v):
+        v %= 2.0
+        return v if v <= 1.0 else 2.0 - v
+    sx = BALL_SPEED_X if sx is None else sx
+    sy = BALL_SPEED_Y if sy is None else sy
+    cx = r + (1.0 - 2 * r) * bounce(BALL_PHASE_X + sx * t)
+    cy = r + (1.0 - 2 * r) * bounce(BALL_PHASE_Y + sy * t)
+
+    out = []
+    a0, an = geom["active0"], geom["active_n"]
+    for i, s0 in enumerate(rows):
+        # Interlace: this field's rows sit half a line below the other's.
+        y = (i + 0.5 * (field & 1)) / n
+        dy = y - cy
+        if abs(dy) >= r:
+            continue
+        hw = math.sqrt(r * r - dy * dy) / PICTURE_ASPECT   # -> width units
+        x0 = int((cx - hw) * an)
+        x1 = int(math.ceil((cx + hw) * an))
+        x0, x1 = max(0, x0), min(an, x1)
+        if x1 <= x0:
+            continue
+        w = x1 - x0
+        e = min(BALL_EDGE_N, w // 2)
+        vals = [white] * w
+        for k in range(e):                      # raised-cosine both edges
+            g = 0.5 - 0.5 * math.cos(math.pi * (k + 0.5) / e)
+            vals[k] = blank_v + (white - blank_v) * g
+            vals[w - 1 - k] = vals[k]
+        out.append((s0 + a0 + x0, vals))
+    return out
+
+
+def build_motion_background(spl, rate):
+    """Static four-field background, normalised, plus its output window.
+
+    The ball is pure white and the bars' chroma already peaks above white, so
+    the window taken from the background also covers the ball -- asserted
+    rather than assumed, since a ball outside the window would clip.
+    """
+    volts, fsc = build_colour_volts(spl, rate)
+    if STD_DC:
+        volts = [v - V_BLANK for v in volts]
+    base = 0.0 if STD_DC else V_BLANK
+    ball_v = base + (BALL_IRE / 100.0) * (V_WHITE - V_BLANK)
+    vlo, vhi = min(volts), max(volts)
+    if not vlo <= ball_v <= vhi:
+        raise RuntimeError(
+            f"ball at {BALL_IRE} IRE ({ball_v:.4f} V) falls outside the "
+            f"background window {vlo:.4f}..{vhi:.4f} V and would clip")
+    offset = (vlo + vhi) / 2.0
+    amplitude = (vhi - vlo) / 2.0
+    total = len(volts)
+    bg = (ctypes.c_double * total)()
+    bg[:] = [(v - offset) / amplitude for v in volts]
+    norm = lambda v: (v - offset) / amplitude
+    print(f"      background {total:,} samples, window {vlo:.4f}..{vhi:.4f} V "
+          f"({(vlo - base) / (V_WHITE - V_BLANK) * 100:+.1f}.."
+          f"{(vhi - base) / (V_WHITE - V_BLANK) * 100:+.1f} IRE)")
+    print(f"      ball {BALL_DIA * 100:.0f}% of picture height at "
+          f"{BALL_IRE:.0f} IRE, {BALL_SPEED_X:.2f} w/s x "
+          f"{BALL_SPEED_Y:.2f} h/s, luma only")
+    return bg, total, amplitude, offset, norm(ball_v), norm(base), fsc
+
+
+MOTION_SECONDS = 4.0               # default --motion loop length
+
+
+def motion_loop_plan(rate, seq_samples, seconds, cap):
+    """Pick a loop length, and ball speeds that make the motion seamless.
+
+    Every four-field sequence closes on a whole number of subcarrier cycles
+    (238,875), so any whole number of them also closes -- the loop point is
+    already clean for the signal. The ball is not: it has to complete a whole
+    number of bounce cycles over the loop or it jumps at the seam. So the
+    requested speeds are rounded to the nearest whole-cycle count.
+    """
+    seq_t = seq_samples / rate
+    n = max(1, round(seconds / seq_t))
+    n = min(n, cap // seq_samples)
+    loop_t = n * seq_t
+    cyc_x = max(1, round(BALL_SPEED_X * loop_t / 2.0))
+    cyc_y = max(1, round(BALL_SPEED_Y * loop_t / 2.0))
+    # Equal cycle counts put x and y in lockstep and the ball traces a single
+    # diagonal line instead of bouncing; a common factor makes the path retrace
+    # itself partway through the loop. Nudge x until the pair is coprime and
+    # distinct. A short loop therefore forces faster motion -- that is the real
+    # trade, and --motion-seconds is how to buy slower motion with memory.
+    while cyc_x == cyc_y or math.gcd(cyc_x, cyc_y) != 1:
+        cyc_x += 1
+    return n, loop_t, 2.0 * cyc_x / loop_t, 2.0 * cyc_y / loop_t, cyc_x, cyc_y
+
+
+def dual_apply_probe(dwf, hdwf, ch, rate, scale, half_n, nbuf, hz,
+                     sacrificial=False, capture_s=0.100, scope_rate=50e6,
+                     path=None, change_to=0):
+    """Does FDwfAnalogOutConfigure(ch, 3) swap a running buffer seamlessly?
+
+    The gating question for strategy A. The manual says fStart 3 "will apply
+    the configuration dynamically without changing the state of the
+    instrument", and samples/py/AnalogOut_DualBuffer.py uses it to replace
+    waveform data mid-run. If that is seamless with funcPlay on a deep-memory
+    channel, content can be swapped at loop boundaries with no PlayData and
+    therefore none of the FIFO-wrap loss.
+
+    The content applied is IDENTICAL each time, deliberately. Any defect in
+    the captured square wave is then attributable to the apply itself rather
+    than to the content changing, and the defect count can be compared against
+    the number of applies issued inside the capture window. A restart rather
+    than a swap also shows up, as a phase jump, because the buffer is a whole
+    number of square periods.
+
+    AD3 reports describe the FIRST apply after a channel start pausing the
+    output in 20-50% of cases, with a sacrificial pair of applies as the
+    workaround -- `sacrificial` exercises that.
+    """
+    period = 2 * half_n
+    n = max(period, (nbuf // period) * period)
+    if n < 2_000_000:
+        # Measured: a DataSet of 200,000 samples returns success and does
+        # NOT take effect -- the channel keeps playing stale deep-memory
+        # content. 2,000,000 does take effect. Refuse to measure below that,
+        # because the earlier square-wave controls came back as video for
+        # exactly this reason and I read it as a device defect.
+        raise RuntimeError(
+            f"--dual-buffer {n:,} is below the 2,000,000 samples at which "
+            f"DataSet was measured to actually take effect. A smaller buffer "
+            f"silently plays stale deep-memory content.")
+    print(f"\nDual-apply probe: funcPlay, {n:,} samples "
+          f"({n // period:,} whole square periods, {n / rate * 1000:.2f} ms "
+          f"playout)")
+    print(f"  applying identical data at {hz} Hz during a "
+          f"{capture_s * 1000:.0f} ms capture")
+    buf = (ctypes.c_double * n)()
+    make_square_filler(half_n)(buf, 0, n)
+
+    check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
+    dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+    check(dwf, dwf.FDwfAnalogOutNodeEnableSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_int(1)), "NodeEnableSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(
+        hdwf, ch, AnalogOutNodeCarrier, funcPlay), "NodeFunctionSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(rate / scale)),
+        "FrequencySet")
+    check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(0.45)),
+        "AmplitudeSet")
+    check(dwf, dwf.FDwfAnalogOutNodeOffsetSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(0.0)), "OffsetSet")
+    check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+        hdwf, ch, AnalogOutNodeCarrier, buf, ctypes.c_int(n)), "DataSet")
+    # Bound the run to OUR buffer. With RunSet(0.0) the device keeps playing
+    # whatever length was last established, so a smaller DataSet does not
+    # truncate it -- stale deep-memory content plays on past our samples,
+    # which is what made the first deep-memory square control come back as
+    # video. The buffer is sized so no repeat boundary falls inside a capture.
+    check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch,
+                                       ctypes.c_double(n / rate)), "RunSet")
+    check(dwf, dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(0)),
+          "RepeatSet")
+    print(f"      run bounded to {n / rate * 1000:.1f} ms so stale "
+          f"deep-memory content cannot play through")
+    check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
+          "Configure(start)")
+    report_output_window(dwf, hdwf, ch, 0.45, 0.0)
+    sts0 = ctypes.c_ubyte()
+    pmin, pmax = ctypes.c_int(), ctypes.c_int()
+    check(dwf, dwf.FDwfAnalogOutNodePlayInfo(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(pmin),
+        ctypes.byref(pmax)), "PlayInfo")
+    gr = ctypes.c_double()
+    check(dwf, dwf.FDwfAnalogOutRunGet(hdwf, ch, ctypes.byref(gr)), "RunGet")
+    gf = ctypes.c_double()
+    check(dwf, dwf.FDwfAnalogOutNodeFrequencyGet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(gf)), "FrequencyGet")
+    for _ in range(3):
+        check(dwf, dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts0)),
+              "AnalogOutStatus")
+        time.sleep(0.05)
+    print(f"      state {DWF_STATE_NAMES.get(sts0.value, sts0.value)}, "
+          f"run {gr.value * 1000:.1f} ms, rate readback "
+          f"{gf.value / 1e6:.4f} MS/s, play memory {pmax.value:,}")
+    # Is W1 actually driven? A DC-ish check: our square sits at +/-0.405 V,
+    # so the capture should show about 810 mV peak to peak.
+    setup_scope(dwf, hdwf)
+    capture(dwf, hdwf, 25e6, 1 << 16)
+    chk = capture(dwf, hdwf, 50e6, 1 << 14)
+    print(f"      quick look at CH1: {min(chk) * 1000:+.1f} .. "
+          f"{max(chk) * 1000:+.1f} mV "
+          f"({(max(chk) - min(chk)) * 1000:.0f} mV p-p; expect ~810)")
+
+    # When change_to is set, the applied buffer carries a DIFFERENT
+    # half-period. Identical content proves the apply is glitch-free but
+    # cannot say WHEN the new data takes effect -- immediately under the
+    # playhead, or deferred to the next buffer wrap. That distinction decides
+    # the whole design: deferred means we can apply any time during a pass,
+    # immediate means the apply has to be timed to land just after a wrap and
+    # the content has to be the continuation from that point.
+    alt = None
+    if change_to:
+        # The capture must span a buffer wrap, and the apply must land well
+        # inside it, or immediate and deferred look identical. A 2 M buffer is
+        # 140 ms, so capture 300 ms and apply at 30 ms: immediate shows the
+        # change near 30-55 ms (a 16 MB DataSet takes ~24 ms), deferred shows
+        # it at the 140 ms wrap.
+        capture_s = max(capture_s, 0.300)
+        alt = (ctypes.c_double * n)()
+        make_square_filler(change_to)(alt, 0, n)
+        print(f"  applied buffer switches the half-period to {change_to} "
+              f"samples, so the transition can be located in time")
+
+    def apply_once():
+        src = alt if alt is not None else buf
+        check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+            hdwf, ch, AnalogOutNodeCarrier, src, ctypes.c_int(n)),
+            "DataSet(apply)")
+        return dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(3))
+
+    if sacrificial:
+        # The reported AD3 workaround: nudge a parameter and apply twice
+        # before the real changes, to absorb the first-apply transient.
+        for f in (rate / scale + 0.01, rate / scale):
+            dwf.FDwfAnalogOutNodeFrequencySet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_double(f))
+            dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(3))
+        print("  issued a sacrificial pair of applies before the capture")
+
+    setup_scope(dwf, hdwf)
+    capture(dwf, hdwf, 25e6, 1 << 16)                  # discard: settling
+    cap_n = int(capture_s * scope_rate)
+    check(dwf, dwf.FDwfAnalogInFrequencySet(hdwf, ctypes.c_double(scope_rate)),
+          "InFrequencySet")
+    check(dwf, dwf.FDwfAnalogInBufferSizeSet(hdwf, ctypes.c_int(cap_n)),
+          "InBufferSizeSet")
+    check(dwf, dwf.FDwfAnalogInConfigure(hdwf, ctypes.c_int(1),
+                                         ctypes.c_int(1)), "InConfigure")
+
+    # Apply while the scope acquires, so applies and defects share a window.
+    sts = ctypes.c_ubyte()
+    applies = refused = 0
+    at = []
+    t0 = time.time()
+    nxt = 0.030 if change_to else 0.0
+    while True:
+        now = time.time() - t0
+        check(dwf, dwf.FDwfAnalogInStatus(hdwf, ctypes.c_int(0),
+                                          ctypes.byref(sts)), "InStatus")
+        if sts.value == DwfStateDone:
+            break
+        if now > capture_s + 5.0:
+            print("  capture timed out")
+            return
+        if hz > 0 and now >= nxt and not (change_to and applies):
+            t_a = time.time() - t0
+            if apply_once() == 1:
+                applies += 1
+                at.append(t_a)
+                print(f"  apply issued at {t_a * 1000:.1f} ms, returned at "
+                      f"{(time.time() - t0) * 1000:.1f} ms")
+            else:
+                refused += 1
+            nxt = now + 1.0 / hz
+    el = time.time() - t0
+    check(dwf, dwf.FDwfAnalogInStatus(hdwf, ctypes.c_int(1),
+                                      ctypes.byref(sts)), "InStatus(read)")
+    out = (ctypes.c_double * cap_n)()
+    check(dwf, dwf.FDwfAnalogInStatusData(hdwf, ctypes.c_int(0), out,
+                                          ctypes.c_int(cap_n)),
+          "InStatusData")
+    print(f"  {applies} applies issued, {refused} refused, over "
+          f"{el * 1000:.0f} ms")
+    samples = list(out)
+    if path:
+        with open(path, "w") as f:
+            for i, v in enumerate(samples):
+                f.write(f"{i / scope_rate:.9f},{v:.6f}\n")
+        print(f"  wrote {path}")
+    if change_to:
+        locate_change(samples, 1e6 / scope_rate, rate, half_n, change_to,
+                      at, n)
+    else:
+        square_integrity(samples, 1e6 / scope_rate, rate, half_n)
+        print(f"\n  CLEAN with {applies} applies in the window means "
+              f"Configure(ch, 3)\n  swaps a running buffer seamlessly, and "
+              f"strategy A is viable.\n  Roughly one defect per apply means "
+              f"the apply itself glitches.")
+    return applies
+
+
+def locate_change(samples, dt_us, rate, old_n, new_n, apply_times, nbuf):
+    """When does applied data actually reach the output?
+
+    Finds where the captured half-period switches from `old_n` to `new_n` and
+    compares that instant against when the apply was issued and against the
+    buffer period. Immediately at the apply means the swap happens under the
+    playhead; one buffer period later means it is deferred to the wrap.
+    """
+    srt = sorted(samples)
+    lo, hi = srt[len(srt) // 200], srt[-(len(srt) // 200) - 1]
+    mid = (lo + hi) / 2.0
+    hi_th, lo_th = mid + 0.25 * (hi - mid), mid - 0.25 * (mid - lo)
+    edges, state = [], 1 if samples[0] > mid else -1
+    for i in range(1, len(samples)):
+        v = samples[i]
+        if (state < 0 and v > hi_th) or (state > 0 and v < lo_th):
+            j = i
+            while j > 0 and ((samples[j - 1] > mid) == (state > 0)):
+                j -= 1
+            a, b = samples[j - 1], samples[j]
+            if b != a:
+                edges.append((j - 1 + (mid - a) / (b - a)) * dt_us)
+            state = -state
+    if len(edges) < 10:
+        print(f"  only {len(edges)} edges; cannot locate the change")
+        return
+    halves = [(edges[i + 1] - edges[i]) * rate / 1e6
+              for i in range(len(edges) - 1)]
+    # Rather than hunt for a transition with a fragile rule, bucket the
+    # half-periods into time slices and print the median of each. The timeline
+    # shows directly what played when, and where the change actually landed.
+    buf_ms = nbuf / rate * 1000
+    print(f"\n=== timeline: median half-period per 10 ms slice ===")
+    print(f"  buffer period {buf_ms:.1f} ms; apply issued at "
+          + ", ".join(f"{t * 1000:.1f} ms" for t in apply_times)
+          + f"; old {old_n}, new {new_n}")
+    slices = {}
+    for i, v in enumerate(halves):
+        k = int(edges[i] / 10000.0)          # edges are us -> 10 ms slices
+        slices.setdefault(k, []).append(v)
+    for k in sorted(slices):
+        xs = sorted(slices[k])
+        med = xs[len(xs) // 2]
+        tag = ("old" if abs(med - old_n) < abs(med - new_n) else "NEW")
+        bar = "#" * min(40, int(med / 5))
+        print(f"  {k * 10:4d}-{k * 10 + 10:4d} ms  n={len(xs):5d}  "
+              f"median {med:7.2f}  {tag}  {bar}")
+    return
+
+
+def square_deep_control(dwf, hdwf, ch, rate, scale, half_n,
+                        capture_s=0.040, scope_rate=50e6, path=None):
+    """Play the square wave from DEEP MEMORY and measure it the same way.
+
+    This is the control for --stream-square, and it should have come first.
+    Deep memory plays a byte-perfect picture with no host involvement, so if
+    the same integrity test reports the same 32-sample defects here, the
+    defects are in the CAPTURE path -- the scope acquiring 100 MB/s while the
+    AWG runs -- and not in streaming at all. If this comes back clean, the
+    streaming defects are real.
+    """
+    # A HARDWARE square wave: funcSquare, generated by the device itself.
+    # No streaming, no play memory, no host involvement at all -- only the DAC
+    # and the scope remain. The deep-memory version of this control came back
+    # unmeasurable (122,762 edges against 5,714 expected), which left the
+    # question open; this removes one more variable.
+    hz = rate / (2.0 * half_n)
+    print(f"\nHardware control: funcSquare at {hz:.3f} Hz, which is a "
+          f"half-period of {half_n} samples at {rate / 1e6:.4f} MS/s")
+    print("  No play memory and no feed -- only the DAC and the scope.")
+
+    check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
+    dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+    check(dwf, dwf.FDwfAnalogOutNodeEnableSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_int(1)), "NodeEnableSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(
+        hdwf, ch, AnalogOutNodeCarrier, funcSquare), "NodeFunctionSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(hz)), "FrequencySet")
+    check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(0.45)), "AmplitudeSet")
+    check(dwf, dwf.FDwfAnalogOutNodeOffsetSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(0.0)), "OffsetSet")
+    check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(0.0)),
+          "RunSet")
+    check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
+          "Configure")
+    got = ctypes.c_double()
+    check(dwf, dwf.FDwfAnalogOutNodeFrequencyGet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(got)), "FrequencyGet")
+    print(f"  device accepted {got.value:.3f} Hz "
+          f"({(got.value / hz - 1) * 100:+.4f}%)")
+    hz = got.value or hz
+    report_output_window(dwf, hdwf, ch, 0.45, 0.0)
+
+    setup_scope(dwf, hdwf)
+    capture(dwf, hdwf, 25e6, 1 << 16)                 # discard: settling
+    time.sleep(0.2)
+    samples = capture(dwf, hdwf, scope_rate, int(capture_s * scope_rate))
+    if path:
+        with open(path, "w") as f:
+            for i, v in enumerate(samples):
+                f.write(f"{i / scope_rate:.9f},{v:.6f}\n")
+        print(f"  wrote {path}")
+    # Measure against the half-period the DEVICE actually produces, so a
+    # frequency it rounded does not read as sample loss.
+    half = rate / (2.0 * hz)
+    if abs(half - round(half)) < 1e-6:
+        half = round(half)
+    square_integrity(samples, 1e6 / scope_rate, rate, half)
+    print("\n  CLEAN here means the DAC and the capture path are sound, so")
+    print("  the defects --motion-stream reports are real. DIRTY here means")
+    print("  the instrument or the capture is at fault and the streaming")
+    print("  numbers cannot be believed.")
+    return 0
+
+
+# --dual: unbounded motion by swapping a deep-memory buffer with
+# Configure(ch, 3). DUAL_SEQ is how many four-field sequences one buffer
+# holds; the buffer must clear 2,000,000 samples or DataSet silently no-ops
+# and the channel keeps playing stale deep-memory content.
+DUAL_SEQ = 4
+
+
+def start_motion_dual(dwf, hdwf, ch, spl, rate, scale):
+    """Unbounded motion from deep memory, no PlayData anywhere.
+
+    One buffer of DUAL_SEQ whole four-field sequences loops in hardware. While
+    pass k plays, pass k+1 is generated into the host buffer and handed over
+    with NodeDataSet + Configure(ch, 3), which was measured to swap a running
+    funcPlay buffer with zero defects -- against 0.63% of half-periods
+    defective for streamed PlayData.
+
+    The swap takes effect immediately rather than at a buffer wrap. That is
+    accepted deliberately: every pass carries identical sync structure and
+    differs only in the ball's position, so a mid-buffer swap cannot disturb
+    sync timing at all. The worst case is the ball jumping by up to one buffer
+    period of travel.
+    """
+    bg, total, amplitude, offset, ball_n, blank_n, fsc = \
+        build_motion_background(spl, rate)
+    geom = motion_geometry(spl, rate)
+    if STREAM_SQUARE:
+        inner = make_square_filler(STREAM_SQUARE)
+        amplitude, offset = 0.5, 0.0
+        print(f"      --stream-square {STREAM_SQUARE}: square wave, not "
+              f"video, so the applies can be\n      checked against the "
+              f"half-period rather than judged by eye")
+    else:
+        inner = make_motion_filler(bg, total, geom, ball_n, blank_n, rate)
+
+    n = DUAL_SEQ * total
+    if n < 2_000_000:
+        raise RuntimeError(
+            f"--dual-seq {DUAL_SEQ} gives {n:,} samples, below the 2,000,000 "
+            f"at which DataSet was measured to take effect. Below that it "
+            f"returns success and the channel keeps playing stale content. "
+            f"Use --dual-seq {-(-2_000_000 // total)} or more.")
+    buf = (ctypes.c_double * n)()
+    t = time.time()
+    inner(buf, 0, n)
+    gen = time.time() - t
+    period = n / rate
+    print(f"      --dual: {DUAL_SEQ} sequences per buffer = {n:,} samples, "
+          f"{period * 1000:.1f} ms playout, {n * 8 / 1e6:.1f} MB")
+    print(f"      generating one buffer costs {gen * 1000:.0f} ms "
+          f"({gen / period * 100:.1f}% of its playout)")
+
+    check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
+    dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+    check(dwf, dwf.FDwfAnalogOutNodeEnableSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_int(1)), "NodeEnableSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(
+        hdwf, ch, AnalogOutNodeCarrier, funcPlay), "NodeFunctionSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(rate / scale)),
+        "FrequencySet")
+    scale_v = LEVEL * (2.0 if SOURCE_SERIES_75R else 1.0)
+    check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
+        hdwf, ch, AnalogOutNodeCarrier,
+        ctypes.c_double(amplitude * scale_v)), "AmplitudeSet")
+    check(dwf, dwf.FDwfAnalogOutNodeOffsetSet(
+        hdwf, ch, AnalogOutNodeCarrier,
+        ctypes.c_double(offset * scale_v)), "OffsetSet")
+    t = time.time()
+    check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+        hdwf, ch, AnalogOutNodeCarrier, buf, ctypes.c_int(n)), "DataSet")
+    up = time.time() - t
+    # RunSet(0.0) with RepeatSet(0) is what --motion uses for a byte-perfect
+    # picture, and avoids the ~24-sample re-arm gap a bounded repeated run
+    # costs at every boundary. The apply validation used a BOUNDED run, so
+    # --stream-square here is what confirms applies are still clean with 0.
+    check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(0.0)),
+          "RunSet")
+    check(dwf, dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(0)),
+          "RepeatSet")
+    check(dwf, dwf.FDwfAnalogOutWaitSet(hdwf, ch, ctypes.c_double(0.0)),
+          "WaitSet")
+    check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
+          "Configure(start)")
+    report_output_window(dwf, hdwf, ch, amplitude * scale_v, offset * scale_v)
+    print(f"      upload {up * 1000:.0f} ms ({n * 8 / up / 1e6:.0f} MB/s); "
+          f"budget per pass is {period * 1000:.0f} ms")
+    print("\nUnbounded motion by buffer swap. Press Ctrl+C to stop.")
+
+    sts = ctypes.c_ubyte()
+    k = 0
+    applies = refused = 0
+    worst = 0.0
+    t0 = last = time.time()
+    nxt = period
+    validated = not (STREAM_SQUARE and STREAM_CAPTURE_AT is not None)
+    try:
+        while True:
+            now = time.time() - t0
+            if now >= nxt:
+                k += 1
+                t = time.time()
+                inner(buf, k * n, n)
+                check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+                    hdwf, ch, AnalogOutNodeCarrier, buf, ctypes.c_int(n)),
+                    "DataSet(apply)")
+                if dwf.FDwfAnalogOutConfigure(hdwf, ch,
+                                              ctypes.c_int(3)) == 1:
+                    applies += 1
+                else:
+                    refused += 1
+                    print(f"  apply refused at pass {k}: {last_error(dwf)}")
+                dt = time.time() - t
+                worst = max(worst, dt)
+                nxt = max(now + 0.001, nxt + period)
+            check(dwf, dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts)),
+                  "AnalogOutStatus")
+            if sts.value != DwfStateRunning:
+                raise RuntimeError(
+                    f"AWG left the running state: "
+                    f"{DWF_STATE_NAMES.get(sts.value, sts.value)}")
+            if not validated and now > 3 * period:
+                validated = True
+                setup_scope(dwf, hdwf)
+                capture(dwf, hdwf, 25e6, 1 << 16)      # discard: settling
+                cn = int(STREAM_CAPTURE_S * 50e6)
+                s = capture(dwf, hdwf, 50e6, cn)
+                if SAVE_CAPTURE:
+                    with open(SAVE_CAPTURE, "w") as f:
+                        for i, v in enumerate(s):
+                            f.write(f"{i / 50e6:.9f},{v:.6f}\n")
+                    print(f"  wrote {SAVE_CAPTURE}")
+                square_integrity(s, 1e6 / 50e6, rate, STREAM_SQUARE)
+                print(f"  (with {applies} applies issued so far, run 0)")
+                t0 = time.time() - now        # keep the pass cadence
+            if time.time() - last >= 5.0:
+                last = time.time()
+                el = time.time() - t0
+                print(f"  {el:6.1f} s  pass {k:,}  applies {applies:,}  "
+                      f"refused {refused}  worst apply {worst * 1000:.0f} ms "
+                      f"of {period * 1000:.0f} ms")
+    except KeyboardInterrupt:
+        el = time.time() - t0
+        print(f"\nStopped after {el:.1f} s: {k:,} passes, "
+              f"{applies:,} applies, {refused} refused, worst apply "
+              f"{worst * 1000:.0f} ms, {k * n / 1e6:.0f} M samples of "
+              f"unique content")
+    return n
+
+
+def start_motion(dwf, hdwf, ch, spl, rate, scale):
+    """A bouncing ball looped out of deep memory -- no host feed at all.
+
+    Uses the one configuration measured to actually reach the screen: the
+    whole buffer in a single DataSet with run 0 and repeat 0, which is how
+    --deep plays its static signal. The only difference here is that the
+    buffer holds many four-field sequences with the ball at a different
+    position in each, so the hardware loop IS the animation.
+    """
+    bg, total, amplitude, offset, ball_n, blank_n, fsc = \
+        build_motion_background(spl, rate)
+    geom = motion_geometry(spl, rate)
+    if geom["total"] != total:
+        raise RuntimeError(f"geometry/background disagree: "
+                           f"{geom['total']} vs {total}")
+    fields = geom["fields"]
+    field_s = total / fields / rate
+
+    pmin, pmax = ctypes.c_int(), ctypes.c_int()
+    check(dwf, dwf.FDwfAnalogOutNodePlayInfo(hdwf, ch, AnalogOutNodeCarrier,
+                                             ctypes.byref(pmin),
+                                             ctypes.byref(pmax)), "PlayInfo")
+    n, loop_t, sx, sy, cx_n, cy_n = motion_loop_plan(
+        rate, total, MOTION_SECONDS, pmax.value)
+    big_n = n * total
+    print(f"      loop {n} sequences = {big_n:,} samples, {loop_t:.3f} s "
+          f"({big_n / pmax.value * 100:.1f}% of play memory, "
+          f"{big_n * 8 / 1e6:.0f} MB on the host)")
+    print(f"      ball {cx_n} horizontal and {cy_n} vertical bounce cycles "
+          f"per loop -> {sx:.3f} w/s x {sy:.3f} h/s, seamless at the seam")
+
+    t0 = time.time()
+    big = (ctypes.c_double * big_n)()
+    for k in range(n):
+        ctypes.memmove(ctypes.byref(big, k * total * 8), bg, total * 8)
+        for f in range(fields):
+            t = (k * fields + f) * field_s
+            for idx, vals in ball_runs(geom, f, t, ball_n, blank_n, sx, sy):
+                a = k * total + idx
+                big[a:a + len(vals)] = vals
+    print(f"      built {n} sequences in {time.time() - t0:.2f} s")
+
+    check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
+    dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+    for fn_, a in ((dwf.FDwfAnalogOutNodeEnableSet, ctypes.c_int(1)),
+                   (dwf.FDwfAnalogOutNodeFunctionSet, funcPlay)):
+        check(dwf, fn_(hdwf, ch, AnalogOutNodeCarrier, a), "node setup")
+    scale_v = LEVEL * (2.0 if SOURCE_SERIES_75R else 1.0)
+    check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(rate / scale)),
+        "FrequencySet")
+    check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
+        hdwf, ch, AnalogOutNodeCarrier,
+        ctypes.c_double(amplitude * scale_v)), "AmplitudeSet")
+    check(dwf, dwf.FDwfAnalogOutNodeOffsetSet(
+        hdwf, ch, AnalogOutNodeCarrier,
+        ctypes.c_double(offset * scale_v)), "OffsetSet")
+    t0 = time.time()
+    check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+        hdwf, ch, AnalogOutNodeCarrier, big, ctypes.c_int(big_n)), "DataSet")
+    print(f"      uploaded {big_n * 8 / 1e6:.0f} MB in "
+          f"{time.time() - t0:.1f} s")
+    # Exactly what --deep does, and the only thing measured to reach a screen.
+    check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(0.0)),
+          "RunSet")
+    check(dwf, dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(0)),
+          "RepeatSet")
+    check(dwf, dwf.FDwfAnalogOutWaitSet(hdwf, ch, ctypes.c_double(0.0)),
+          "WaitSet")
+    check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
+          "Configure")
+    report_output_window(dwf, hdwf, ch, amplitude * scale_v, offset * scale_v)
+    print(f"\nLooping {loop_t:.3f} s of motion from deep memory, entirely in "
+          f"hardware. Press Ctrl+C to stop.")
+    return big_n
+
+
+def stream_chunk(fifo, fill, remaining, align=1):
+    """Samples to hand over now, given the estimated FIFO fill.
+
+    `fill` may be NEGATIVE when the feed has fallen behind the playhead, and
+    clamping it at zero is what keeps the request inside the FIFO. Without the
+    clamp, being 0.13 ms behind asks for 34,669 samples of a 32,768-sample
+    FIFO and the device rejects the whole call with "Invalid data count
+    provided". feed_tune's loop had the clamp; porting it into stream_feed
+    dropped it.
+
+    The redundant `fifo` term is a deliberate invariant: whatever the fill
+    estimate does, the request can never exceed the FIFO.
+    """
+    room = fifo - max(0.0, fill)
+    n = max(0, int(min(room, fifo, remaining)))
+    if align > 1:
+        n -= n % align
+    return n
+
+
+def pick_stream_config(dwf, force=None):
+    """Configuration that can actually stream: play memory 0, deepest scope.
+
+    Measured by --feed-matrix: PlayData reaches W1 only where
+    DECIAnalogOutPlaySize is 0. The configurations advertising 67 M or 134 M
+    of play memory accept PlayData at 63-72 MS/s, report zero lost and zero
+    corrupted, and play the primed buffer on loop instead -- so pick_deep_config
+    is exactly the wrong chooser for a stream.
+    """
+    ndev, ncfg = ctypes.c_int(), ctypes.c_int()
+    check(dwf, dwf.FDwfEnum(ctypes.c_int(0), ctypes.byref(ndev)), "FDwfEnum")
+    if ndev.value == 0:
+        raise RuntimeError("No Digilent device found. Close WaveForms and replug.")
+    check(dwf, dwf.FDwfEnumConfig(ctypes.c_int(0), ctypes.byref(ncfg)),
+          "FDwfEnumConfig")
+    best, best_scope = -1, -1
+    for i in range(ncfg.value):
+        play, scope = ctypes.c_int(), ctypes.c_int()
+        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogOutPlaySize,
+                               ctypes.byref(play))
+        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogInBufferSize,
+                               ctypes.byref(scope))
+        print(f"  config {i}: play memory {play.value} samples, "
+              f"scope buffer {scope.value}"
+              + ("  <- can stream" if play.value == 0 else ""))
+        if play.value == 0 and scope.value > best_scope:
+            best, best_scope = i, scope.value
+    if force is not None:
+        print(f"  -> config {force} (forced)")
+        return force
+    if best < 0:
+        raise RuntimeError("No configuration reports play memory 0, so none "
+                           "can stream on this unit. Run --feed-matrix.")
+    print(f"  -> config {best} (streams; scope buffer {best_scope:,})")
+    return best
+
+
+def check_chain_gain(prof, expect_sync_v):
+    """Warn when the captured sync depth does not track what we are driving.
+
+    A passive chain has a fixed gain, so measured sync depth must scale with
+    the output level. If it does not, something between W1 and the scope is
+    REGENERATING the signal -- a time base corrector does exactly that -- and
+    the capture then describes that device's output, not ours. Two runs an
+    output level of 1.87x apart both measured 534.8 and 534.7 mV of sync
+    depth, which is how this was eventually noticed; it should have been
+    flagged the first time.
+    """
+    if not expect_sync_v:
+        return
+    got = prof.get("sync_mv")
+    if not got:
+        return
+    want = expect_sync_v * 1000.0
+    ratio = got / want
+    print(f"  chain gain  driving {want:.1f} mV of sync at W1, measured "
+          f"{got:.1f} mV -> {ratio:.3f}x")
+    if not 0.2 < ratio < 5.0:
+        print("  WARNING: implausible chain gain. Check the probe point.")
+    print("  NOTE: if this ratio changes when --level changes, the chain is "
+          "not\n        passive -- something is regenerating sync, and this "
+          "capture\n        describes ITS output rather than ours. Tap W1 "
+          "directly.")
+
+
+def describe_capture(samples, dt_us):
+    """Say what a capture actually contains when no sync was found.
+
+    profile_capture reports nan for everything when it finds no h-sync, which
+    says nothing about why. A flat trace, a noisy one and a real waveform at
+    the wrong level all produce the same nans, and they need different fixes.
+    """
+    srt = sorted(samples)
+    n = len(srt)
+    q = lambda f: srt[min(n - 1, int(f * n))]
+    lo, hi = q(0.005), q(0.995)
+    print(f"\n=== capture has no recognisable h-sync ===")
+    print(f"  {n:,} samples, {n * dt_us:.2f} us at "
+          f"{1.0 / dt_us:.1f} MS/s")
+    print(f"  min {min(samples) * 1000:+8.1f} mV   max "
+          f"{max(samples) * 1000:+8.1f} mV   p-p "
+          f"{(max(samples) - min(samples)) * 1000:8.1f} mV")
+    print(f"  percentiles  0.5% {lo * 1000:+8.1f}   50% {q(0.5) * 1000:+8.1f}"
+          f"   99.5% {hi * 1000:+8.1f} mV")
+    span = hi - lo
+    if span < 0.050:
+        print(f"  FLAT: 99% of samples inside {span * 1000:.1f} mV. Nothing is "
+              f"driving the input, or the capture missed the signal.")
+        return
+    # How long does it stay below the sync threshold? Real sync is ~4.7 us.
+    runs = runs_below(samples, dt_us, lo + 0.13 * span)
+    if runs:
+        w = sorted(x for _, x in runs)
+        print(f"  {len(runs):,} runs below the sync threshold, widths "
+              f"{w[0]:.3f}..{w[-1]:.3f} us, median {w[len(w) // 2]:.3f} "
+              f"(h-sync should be ~4.7)")
+        if w[-1] < 0.5:
+            print(f"  NOISE: the longest excursion is {w[-1] * 1000:.0f} ns. "
+                  f"This is a threshold crossed by noise, not sync pulses. "
+                  f"The usual cause is an unsettled input stage -- discard one "
+                  f"capture after setup_scope.")
+    print(f"  first 16 samples (mV): "
+          + " ".join(f"{v * 1000:+.0f}" for v in samples[:16]))
+
+
+def stream_line_jitter(samples, dt_us, rate, spl):
+    """Line-to-line sync spacing from a capture -- the "sync slightly off" test.
+
+    Reports the distribution of intervals between successive horizontal sync
+    edges. A clean generator holds this to a few tens of nanoseconds. Gaps that
+    are an exact multiple of a chunk, or of a line, say something different
+    from gaps that are random.
+    """
+    srt = sorted(samples)
+    lo, hi = srt[len(srt) // 200], srt[-(len(srt) // 200) - 1]
+    runs = runs_below(samples, dt_us, lo + 0.13 * (hi - lo))
+    edges = [t for t, w in runs if 3.5 <= w <= 15]        # h-sync only
+    if len(edges) < 20:
+        print("  jitter: too few h-sync edges")
+        return
+    iv = [(edges[i + 1] - edges[i]) for i in range(len(edges) - 1)]
+    iv = [x for x in iv if x < 200.0]                     # drop VBI gaps
+    if not iv:
+        print("  jitter: no usable line intervals")
+        return
+    srt_iv = sorted(iv)
+    med = srt_iv[len(srt_iv) // 2]
+    nominal = spl / rate * 1e6 if spl else med
+    print(f"  line interval  median {med:.4f} us (built {nominal:.4f}), "
+          f"spread {srt_iv[0]:.4f}..{srt_iv[-1]:.4f} us over {len(iv)} lines")
+    print(f"                 p-p jitter {(srt_iv[-1] - srt_iv[0]) * 1000:.0f} ns, "
+          f"median error {(med - nominal) * 1000:+.0f} ns")
+    outliers = [(i, x) for i, x in enumerate(iv) if abs(x - med) > 0.100]
+    if not outliers:
+        print("                 no line more than 100 ns off the median")
+        return
+    print(f"                 {len(outliers)} of {len(iv)} lines more than "
+          f"100 ns off:")
+    for i, x in outliers[:8]:
+        print(f"                   line {i:4} {x:9.4f} us "
+              f"({(x - med) * 1000:+.0f} ns)")
+    if len(outliers) > 1:
+        gaps = [outliers[k + 1][0] - outliers[k][0]
+                for k in range(len(outliers) - 1)]
+        gs = sorted(gaps)
+        print(f"                 spacing between outliers: median "
+              f"{gs[len(gs) // 2]} lines, range {gs[0]}..{gs[-1]}")
+
+
+def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
+                rate_check=False, spl_hint=None, capture_at=None,
+                capture_path=None, capture_s=0.040, scope_rate=50e6,
+                expect_sync_v=None):
+    """Stream an arbitrary signal, generated on demand, paced against a clock.
+
+    `fill_fn(dst, abs_pos, n)` writes n samples of the signal starting at
+    absolute sample index abs_pos into `dst`. That is the whole interface: the
+    content can be anything, is never bounded by device memory, and nothing is
+    precomputed.
+
+    The structure is the one --feed-tune measured clean at 14.295 MS/s, and it
+    is shaped entirely by two timings in a streaming configuration:
+
+        FDwfAnalogOutStatus            1792 us
+        FDwfAnalogOutNodePlayStatus       2 us
+
+    The FIFO is only about 2.29 ms deep at the colour rate, so a single
+    AnalogOutStatus is 78% of the whole budget and underruns the device. It is
+    therefore NEVER called here unless rate_check asks for it. PlayStatus is
+    cheap, but returns STALE values without it -- so `free` is used only for
+    the lost and corrupted counters, never for sizing. Sizing comes from the
+    clock: the device consumes at exactly the rate we set, so
+    fill = fed - elapsed * rate.
+
+    rate_check trades the signal for a measurement: it pays for
+    AnalogOutStatus so `free` is trustworthy, and then
+    (fed - (fifo - free)) / elapsed is the device's real consumption rate. It
+    WILL underrun while running, so it is a diagnostic, not a mode to play in.
+    """
+    # A garbage collection pass longer than the FIFO's 2.29 ms starves the
+    # device, and the counters do not report it. The loop allocates nothing
+    # per iteration, so there is nothing for the collector to find anyway.
+    gc_was_on = gc.isenabled()
+    gc.disable()
+    staging = (ctypes.c_double * fifo)()
+    abs_pos = fifo              # the prime already delivered the first `fifo`
+    fed = fifo
+    free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+    sts = ctypes.c_ubyte()
+    t_poll = 0.0
+    t_resync = STREAM_RESYNC_S if STREAM_RESYNC_S > 0 else float("inf")
+    resyncs = 0
+    drift_sum = 0.0
+    t_rep = report
+    t0 = time.time()
+    worst_fill = float("inf")
+    actual = 0.0
+    t_lost = t_corr = 0
+    # Interleaved capture: acquisition runs in device hardware, so arming it
+    # and polling costs almost nothing. Only the final read stalls the feed,
+    # and by then the samples are already taken -- so the capture reflects a
+    # healthy stream rather than one disturbed by its own measurement.
+    cap_n = int(capture_s * scope_rate) if capture_at is not None else 0
+    cap_state = "idle"
+    in_sts = ctypes.c_ubyte()
+    # Its own timer. Sharing t_poll with the PlayStatus poll meant that block
+    # advanced the deadline first and this one never fired at all.
+    t_cap = 0.0
+    cap_armed_at = 0.0
+    try:
+        while True:
+            now = time.time() - t0
+            fill = fed - now * rate
+            if now > 0.25:
+                worst_fill = min(worst_fill, fill)
+
+            if STREAM_DOC and cap_state != "armed":
+                # The manual's loop, exactly: read device state, ask how much
+                # room there is, send that much. No estimate anywhere.
+                check(dwf, dwf.FDwfAnalogOutStatus(hdwf, ch,
+                                                   ctypes.byref(sts)),
+                      "AnalogOutStatus")
+                check(dwf, dwf.FDwfAnalogOutNodePlayStatus(
+                    hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                    ctypes.byref(lost), ctypes.byref(corrupt)), "PlayStatus")
+                t_lost += lost.value
+                t_corr += corrupt.value
+                n = min(max(0, free.value), fifo)
+                if STREAM_ALIGN > 1:
+                    n -= n % STREAM_ALIGN
+                if n > 0:
+                    fill_fn(staging, abs_pos, n)
+                    check(dwf, dwf.FDwfAnalogOutNodePlayData(
+                        hdwf, ch, AnalogOutNodeCarrier, staging,
+                        ctypes.c_int(n)), "PlayData")
+                    fed += n
+                    abs_pos += n
+                if now >= t_rep:
+                    print(f"  {now:6.1f} s  fed {fed / now / 1e6:6.3f} MS/s "
+                          f"(need {rate / 1e6:.3f})  free {free.value:>7,}  "
+                          f"lost {t_lost:,}  corrupt {t_corr:,}")
+                    t_rep = now + report
+
+            # Closed-loop resync. Read the TRUE free space, refill by exactly
+            # that much -- the only write size we can be certain of -- and
+            # reset the estimate to "full". Costs 1792 us, during which a full
+            # FIFO drains to about 0.5 ms, so it must not run often.
+            if (STREAM_RESYNC_S > 0 and cap_state != "armed"
+                    and now >= t_resync):
+                check(dwf, dwf.FDwfAnalogOutStatus(hdwf, ch,
+                                                   ctypes.byref(sts)),
+                      "AnalogOutStatus")
+                check(dwf, dwf.FDwfAnalogOutNodePlayStatus(
+                    hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                    ctypes.byref(lost), ctypes.byref(corrupt)), "PlayStatus")
+                t_lost += lost.value
+                t_corr += corrupt.value
+                room = min(max(0, free.value), fifo)
+                if STREAM_ALIGN > 1:
+                    room -= room % STREAM_ALIGN
+                if room > 0:
+                    fill_fn(staging, abs_pos, room)
+                    check(dwf, dwf.FDwfAnalogOutNodePlayData(
+                        hdwf, ch, AnalogOutNodeCarrier, staging,
+                        ctypes.c_int(room)), "PlayData(resync)")
+                    abs_pos += room
+                    fed += room
+                now = time.time() - t0
+                drift_sum += (fed - now * rate) - fifo
+                fed = now * rate + fifo          # estimate := FIFO full
+                resyncs += 1
+                t_resync = now + STREAM_RESYNC_S
+
+            target = max(1, fifo - STREAM_GUARD)
+            n = (0 if STREAM_DOC
+                 else stream_chunk(target, fill, fifo, STREAM_ALIGN))
+            if n > 0:
+                fill_fn(staging, abs_pos, n)
+                if dwf.FDwfAnalogOutNodePlayData(
+                        hdwf, ch, AnalogOutNodeCarrier, staging,
+                        ctypes.c_int(n)) != 1:
+                    raise RuntimeError(f"PlayData refused {n} samples at "
+                                       f"{now:.2f} s: {last_error(dwf)}")
+                fed += n
+                abs_pos += n
+
+            if now >= t_poll:
+                if rate_check:
+                    dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts))
+                dwf.FDwfAnalogOutNodePlayStatus(hdwf, ch, AnalogOutNodeCarrier,
+                                                ctypes.byref(free),
+                                                ctypes.byref(lost),
+                                                ctypes.byref(corrupt))
+                t_lost += lost.value
+                t_corr += corrupt.value
+                if rate_check:
+                    now = time.time() - t0
+                    if now > 0.5:
+                        in_fifo = min(max(0, fifo - free.value), fifo)
+                        actual = (fed - in_fifo) / now
+                t_poll = now + poll
+
+            if capture_at is not None and cap_state != "done":
+                if cap_state == "idle" and now >= capture_at:
+                    # Every one of these was unchecked, and a refused
+                    # BufferSizeSet leaves StatusData filling nothing -- which
+                    # reads as a FLAT capture and looks like a dead cable.
+                    bmin, bmax = ctypes.c_int(), ctypes.c_int()
+                    check(dwf, dwf.FDwfAnalogInBufferSizeInfo(
+                        hdwf, ctypes.byref(bmin), ctypes.byref(bmax)),
+                        "InBufferSizeInfo")
+                    if cap_n > bmax.value:
+                        print(f"  capture clamped {cap_n:,} -> {bmax.value:,} "
+                              f"samples (device maximum)")
+                        cap_n = bmax.value
+                    check(dwf, dwf.FDwfAnalogInFrequencySet(
+                        hdwf, ctypes.c_double(scope_rate)), "InFrequencySet")
+                    check(dwf, dwf.FDwfAnalogInBufferSizeSet(
+                        hdwf, ctypes.c_int(cap_n)), "InBufferSizeSet")
+                    # Fill the FIFO completely first: once armed we stop
+                    # feeding, so whatever is in there is all the signal the
+                    # capture will see.
+                    n0 = stream_chunk(fifo, fed - now * rate, fifo,
+                                      STREAM_ALIGN)
+                    if n0 > 0:
+                        fill_fn(staging, abs_pos, n0)
+                        check(dwf, dwf.FDwfAnalogOutNodePlayData(
+                            hdwf, ch, AnalogOutNodeCarrier, staging,
+                            ctypes.c_int(n0)), "PlayData(pre-capture)")
+                        fed += n0
+                        abs_pos += n0
+                    check(dwf, dwf.FDwfAnalogInConfigure(
+                        hdwf, ctypes.c_int(1), ctypes.c_int(1)),
+                        "InConfigure")
+                    gf, gn = ctypes.c_double(), ctypes.c_int()
+                    check(dwf, dwf.FDwfAnalogInFrequencyGet(
+                        hdwf, ctypes.byref(gf)), "InFrequencyGet")
+                    check(dwf, dwf.FDwfAnalogInBufferSizeGet(
+                        hdwf, ctypes.byref(gn)), "InBufferSizeGet")
+                    print(f"  arming scope at {now:.1f} s: asked {cap_n:,} "
+                          f"samples at {scope_rate / 1e6:.0f} MS/s, device "
+                          f"gave {gn.value:,} at {gf.value / 1e6:.3f} MS/s "
+                          f"(range {bmin.value:,}..{bmax.value:,})")
+                    if gn.value != cap_n:
+                        print(f"  NOTE: buffer is {gn.value:,}, not "
+                              f"{cap_n:,}; reading the smaller count")
+                        cap_n = gn.value
+                    cap_state = "armed"
+                    cap_armed_at = now
+                    t_cap = now + 0.05
+                elif cap_state == "armed":
+                    # Keep feeding during acquisition. The pause here was
+                    # added on a concurrency theory that turned out to be a
+                    # disconnected CH1; with the jumper in place a running
+                    # feed captures fine, and the window has to span more
+                    # than one field (16.7 ms) to contain a vertical interval.
+                    t_cap = now + 0.002
+                    check(dwf, dwf.FDwfAnalogInStatus(
+                        hdwf, ctypes.c_int(0), ctypes.byref(in_sts)),
+                        "InStatus(poll)")
+                    if (in_sts.value != DwfStateDone
+                            and now - cap_armed_at > 10.0):
+                        st = DWF_STATE_NAMES.get(in_sts.value,
+                                                 in_sts.value)
+                        print(f"  capture timed out after 10 s in state "
+                              f"{st} -- no trigger? nothing written.")
+                        cap_state = "done"
+                    elif in_sts.value == DwfStateDone:
+                        print(f"  acquired at {now:.1f} s "
+                              f"(lost {t_lost:,}, corrupt {t_corr:,} so far)")
+                        check(dwf, dwf.FDwfAnalogInStatus(
+                            hdwf, ctypes.c_int(1), ctypes.byref(in_sts)),
+                            "InStatus(read)")
+                        buf = (ctypes.c_double * cap_n)()
+                        check(dwf, dwf.FDwfAnalogInStatusData(
+                            hdwf, ctypes.c_int(0), buf, ctypes.c_int(cap_n)),
+                            "InStatusData")
+                        samples = list(buf)
+                        cap_state = "done"
+                        if capture_path:
+                            with open(capture_path, "w") as f:
+                                f.write("t,v\n")
+                                for i, v in enumerate(samples):
+                                    f.write(f"{i / scope_rate:.9f},{v:.6f}\n")
+                            print(f"  wrote {capture_path}")
+                        # dt is in MICROSECONDS here (compare_captures
+                        # defaults to 0.020 for 50 MS/s), not seconds.
+                        dt_us = 1e6 / scope_rate
+                        if STREAM_SQUARE:
+                            square_integrity(samples, dt_us, rate,
+                                             STREAM_SQUARE)
+                        else:
+                            prof = profile_capture(samples, dt_us)
+                            if (prof is None
+                                    or not prof.get("counts", (0,))[0]):
+                                describe_capture(samples, dt_us)
+                            else:
+                                show_profile(prof, "streamed output")
+                                check_chain_gain(prof, expect_sync_v)
+                            stream_line_jitter(samples, dt_us, rate,
+                                               spl_hint)
+                        # Reading a large buffer stalls the loop, so the
+                        # clock-paced estimate is stale afterwards. Re-baseline
+                        # it to "FIFO full" rather than chasing the deficit.
+                        t0 = time.time() - (fed - fifo) / rate
+                        print("  pacing clock re-baselined after readback")
+
+            if now >= t_rep:
+                wf = (0.0 if worst_fill == float("inf")
+                      else worst_fill / rate * 1000)
+                dr = (drift_sum / resyncs / rate * 1000) if resyncs else 0.0
+                extra = (f"  device {actual / 1e6:6.3f} MS/s "
+                         f"({(actual / rate - 1) * 100:+.3f}%)"
+                         if actual else "")
+                print(f"  {now:6.1f} s  fed {fed / now / 1e6:6.3f} MS/s "
+                      f"(need {rate / 1e6:.3f}){extra}  fill "
+                      f"{fill / rate * 1000:+5.2f} ms  min {wf:+5.2f} ms  "
+                      f"resync {resyncs} (drift {dr:+.2f} ms)  "
+                      f"lost {t_lost:,}  corrupt {t_corr:,}")
+                t_rep = now + report
+    except KeyboardInterrupt:
+        el = time.time() - t0
+        wf = 0.0 if worst_fill == float("inf") else worst_fill / rate * 1000
+        print(f"\nStopped after {el:.1f} s: {fed / 1e6:.1f} M samples at "
+              f"{fed / el / 1e6:.3f} MS/s, minimum fill {wf:.2f} ms, "
+              f"lost {t_lost:,}, corrupt {t_corr:,}")
+        if gc_was_on:
+            gc.enable()
+        if actual and spl_hint:
+            line_hz = actual / spl_hint
+            print(f"  device consumed {actual / 1e6:.4f} MS/s vs "
+                  f"{rate / 1e6:.4f} requested "
+                  f"({(actual / rate - 1) * 100:+.3f}%)")
+            print(f"  -> line {line_hz:.2f} Hz (NTSC 15734.27), field "
+                  f"{line_hz / 262.5:.4f} Hz (NTSC 59.9401)")
+
+
+def make_padded_filler(inner, pad_n, every, fifo):
+    """Wrap a fill_fn to insert `pad_n` padding samples every `every` real ones.
+
+    Pre-compensation for the device's FIFO-wrap loss. The ring buffer discards
+    exactly 32 samples per 32,768-sample revolution -- deterministic, measured
+    as defects of exactly -32.00 samples spaced exactly 32,800 apart (32,800
+    minus the 32 that vanish is the 32,768 FIFO). So feeding 32 padding
+    samples at that cadence means the block the device throws away is padding
+    rather than picture.
+
+    This fixes the TIMING even when the phase is wrong, which is what matters:
+    a mis-phased pad costs one local glitch of about 64 samples but the sample
+    count per revolution still balances, so nothing accumulates and the
+    picture stops rolling. Padding is a hold of the last real sample, so the
+    artifact is a brief smear rather than a jump.
+
+    `inner` is called with a content position that advances only over real
+    samples, so the signal it generates is never itself distorted.
+    """
+    scratch = (ctypes.c_double * fifo)()
+    st = {"since": 0, "pad_left": 0, "pos": 0, "last": 0.0,
+          "pads": 0, "real": 0}
+
+    def fill(dst, _abs_pos, n):
+        i = 0
+        while i < n:
+            if st["pad_left"] > 0:
+                m = min(st["pad_left"], n - i)
+                v = st["last"]
+                for j in range(m):
+                    dst[i + j] = v
+                st["pad_left"] -= m
+                i += m
+                continue
+            m = min(every - st["since"], n - i)
+            inner(scratch, st["pos"], m)
+            ctypes.memmove(ctypes.byref(dst, i * 8), scratch, m * 8)
+            st["last"] = scratch[m - 1]
+            st["pos"] += m
+            st["since"] += m
+            st["real"] += m
+            i += m
+            if st["since"] >= every:
+                st["since"] = 0
+                st["pad_left"] = pad_n
+                st["pads"] += 1
+    fill.stats = st
+    return fill
+
+
+def make_square_filler(half_n, lo=-0.9, hi=0.9):
+    """A fill_fn producing a square wave toggling every `half_n` samples.
+
+    This is the integrity instrument. DC cannot reveal a dropped or duplicated
+    sample, and video is too complex to attribute a defect to one cause -- but
+    a square wave with a known half-period in SAMPLES turns any sample the
+    device loses or repeats into a measurable change in a half-period, with a
+    position and a size. It answers the one question nothing else has: does
+    PlayData deliver exactly the samples we hand it?
+    """
+    # One period, tiled with memmove. The first version wrote every sample
+    # from Python and cost 2.761 ms per chunk against a 2.29 ms FIFO -- it
+    # starved the feed it was built to measure, and reported the resulting
+    # underruns as device defects.
+    period = 2 * half_n
+    tile = (ctypes.c_double * period)()
+    for i in range(period):
+        tile[i] = hi if (i // half_n) % 2 == 0 else lo
+
+    def fill(dst, abs_pos, n):
+        done = 0
+        while done < n:
+            off = (abs_pos + done) % period
+            m = min(n - done, period - off)
+            ctypes.memmove(ctypes.byref(dst, done * 8),
+                           ctypes.byref(tile, off * 8), m * 8)
+            done += m
+    return fill
+
+
+def square_integrity(samples, dt_us, rate, half_n):
+    """Measure a captured square wave's half-periods, in output samples.
+
+    A clean stream gives every half-period as exactly `half_n` samples. Each
+    deviation is a count of samples gained or lost, and the spacing between
+    deviations says whether they follow the chunk size, the sequence, or
+    nothing at all.
+    """
+    srt = sorted(samples)
+    n = len(srt)
+    lo, hi = srt[n // 200], srt[-(n // 200) - 1]
+    if hi - lo < 0.050:
+        print(f"\n  square wave: FLAT ({(hi - lo) * 1000:.1f} mV p-p). "
+              f"Nothing on the input.")
+        return
+    mid = (lo + hi) / 2.0
+    # Schmitt trigger, not a bare mid-crossing. A naive detector counted
+    # 181,055 edges on a capture that held about 5,715, because every
+    # transition and any noise near mid produced a cluster of crossings. An
+    # edge is only accepted once the signal has reached a quarter of the way
+    # to the far rail, and its time is taken from the mid crossing.
+    hi_th = mid + 0.25 * (hi - mid)
+    lo_th = mid - 0.25 * (mid - lo)
+    edges = []
+    state = 1 if samples[0] > mid else -1
+    for i in range(1, len(samples)):
+        v = samples[i]
+        if state < 0 and v > hi_th:
+            j = i
+            while j > 0 and samples[j - 1] > mid:
+                j -= 1
+            a, b = samples[j - 1], samples[j]
+            if b != a:
+                edges.append((j - 1 + (mid - a) / (b - a)) * dt_us)
+            state = 1
+        elif state > 0 and v < lo_th:
+            j = i
+            while j > 0 and samples[j - 1] < mid:
+                j -= 1
+            a, b = samples[j - 1], samples[j]
+            if b != a:
+                edges.append((j - 1 + (mid - a) / (b - a)) * dt_us)
+            state = -1
+    want_edges = len(samples) * dt_us / (half_n / rate * 1e6)
+    if len(edges) < 20:
+        print(f"\n  square wave: only {len(edges)} edges found; "
+              f"cannot measure.")
+        return
+    if len(edges) > 3 * want_edges:
+        print(f"\n  square wave: {len(edges):,} edges where about "
+              f"{want_edges:,.0f} are expected -- the capture is not a clean "
+              f"square wave, so these statistics would be meaningless.")
+        describe_capture(samples, dt_us)
+        return
+    want_us = half_n / rate * 1e6
+    halves = [(edges[i + 1] - edges[i]) for i in range(len(edges) - 1)]
+    in_smp = [h * rate / 1e6 for h in halves]
+    srt_s = sorted(in_smp)
+    med = srt_s[len(srt_s) // 2]
+    print(f"\n=== sample-stream integrity ===")
+    print(f"  square wave, half-period {half_n} samples "
+          f"({want_us:.3f} us at {rate / 1e6:.4f} MS/s)")
+    print(f"  {len(edges):,} edges, {len(halves):,} half-periods over "
+          f"{len(samples) * dt_us / 1000:.2f} ms")
+    print(f"  half-period  median {med:.3f} samples (want {half_n}), "
+          f"range {srt_s[0]:.3f}..{srt_s[-1]:.3f}")
+    # A deviation of half a sample or more is a real gained/lost sample.
+    bad = [(i, v) for i, v in enumerate(in_smp) if abs(v - half_n) >= 0.5]
+    if not bad:
+        print(f"  CLEAN: every half-period within 0.5 samples of {half_n}.")
+        print(f"  The device delivers the stream faithfully at this rate.")
+        return
+    net = sum(v - half_n for v in in_smp)
+    print(f"  {len(bad)} of {len(halves)} half-periods off by >= 0.5 samples "
+          f"({len(bad) / len(halves) * 100:.2f}%)")
+    print(f"  net sample error over the capture: {net:+.1f} samples "
+          f"({net / rate * 1e6:+.1f} us)")
+    for i, v in bad[:10]:
+        print(f"    half-period {i:5}  {v:8.3f} samples "
+              f"({v - half_n:+.2f})  at {edges[i] / 1000:.3f} ms")
+    if len(bad) > 1:
+        gaps = [bad[k + 1][0] - bad[k][0] for k in range(len(bad) - 1)]
+        gs = sorted(gaps)
+        smp_between = gs[len(gs) // 2] * half_n
+        print(f"  spacing between defects: median {gs[len(gs) // 2]} "
+              f"half-periods = {smp_between:,} samples, "
+              f"range {gs[0]}..{gs[-1]}")
+        print(f"  (chunk is up to 32,768 samples; one sequence is the "
+              f"frame length)")
+
+
+def make_background_filler(bg, total):
+    """A fill_fn that streams the static background, with no ball painted.
+
+    Exists to hold content constant: this is byte-for-byte what --deep loads
+    into deep memory and plays perfectly, so if streaming it still rolls, the
+    cause is delivery and not anything we generate.
+    """
+    def fill(dst, abs_pos, n):
+        done = 0
+        while done < n:
+            off = (abs_pos + done) % total
+            m = min(n - done, total - off)
+            ctypes.memmove(ctypes.byref(dst, done * 8),
+                           ctypes.byref(bg, off * 8), m * 8)
+            done += m
+    return fill
+
+
+def make_motion_filler(bg, total, geom, ball_n, blank_n, rate):
+    """A fill_fn that paints the bouncing ball over the background on demand.
+
+    Generating per chunk instead of per sequence is what keeps the feed loop
+    inside the FIFO budget: rebuilding a whole 953,400-sample sequence on each
+    wrap cost about 0.8 ms, 35% of a 2.29 ms FIFO, and underran the device.
+    Per chunk it is a 262 KB memmove plus a handful of short runs.
+
+    It is also the general shape for streaming anything: given an absolute
+    sample index and a count, produce those samples.
+    """
+    fields = geom["fields"]
+    field_s = total / fields / rate
+    cache = {}
+
+    def runs_for(seq):
+        """Ball runs for one sequence, as (absolute index, values)."""
+        got = cache.get(seq)
+        if got is None:
+            got = []
+            for f in range(fields):
+                t = (seq * fields + f) * field_s
+                for idx, vals in ball_runs(geom, f, t, ball_n, blank_n):
+                    got.append((seq * total + idx, vals))
+            cache[seq] = got
+            for k in list(cache):
+                if k < seq - 1:         # keep only the current and previous
+                    del cache[k]
+        return got
+
+    def fill(dst, abs_pos, n):
+        # Background first, wrapping at the sequence boundary.
+        done = 0
+        while done < n:
+            off = (abs_pos + done) % total
+            m = min(n - done, total - off)
+            ctypes.memmove(ctypes.byref(dst, done * 8),
+                           ctypes.byref(bg, off * 8), m * 8)
+            done += m
+        # Then any ball runs that overlap this window.
+        end = abs_pos + n
+        for seq in range(abs_pos // total, (end - 1) // total + 1):
+            for a, vals in runs_for(seq):
+                b = a + len(vals)
+                if b <= abs_pos or a >= end:
+                    continue
+                lo, hi = max(a, abs_pos), min(b, end)
+                dst[lo - abs_pos:hi - abs_pos] = vals[lo - a:hi - a]
+    return fill
+
+
+def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
+    """Stream the bouncing ball indefinitely, generated chunk by chunk.
+
+    Nothing is precomputed and nothing repeats: the ball's position is a
+    function of the absolute sample index, so this runs until stopped.
+    """
+    bg, total, amplitude, offset, ball_n, blank_n, fsc = \
+        build_motion_background(spl, rate)
+    geom = motion_geometry(spl, rate)
+    if STREAM_SQUARE:
+        fill_fn = make_square_filler(STREAM_SQUARE)
+        print(f"      --stream-square {STREAM_SQUARE}: square wave, not "
+              f"video. Measures whether the\n      device delivers our "
+              f"samples faithfully; video cannot isolate that.")
+    elif STREAM_STATIC:
+        fill_fn = make_background_filler(bg, total)
+        print("      --stream-static: no ball. Content is byte-identical to "
+              "what --deep plays,\n"
+              "      so delivery is the only remaining difference.")
+    else:
+        fill_fn = make_motion_filler(bg, total, geom, ball_n, blank_n, rate)
+
+    if STREAM_CAPTURE_AT is not None:
+        # Before the AWG, matching the order feed_one_config used -- which did
+        # read CH1 correctly in this configuration. setup_scope documents that
+        # the first acquisition after a range change is wrong, so discard one;
+        # doing it here costs the feed nothing because nothing is streaming yet.
+        setup_scope(dwf, hdwf)
+        capture(dwf, hdwf, 25e6, 1 << 16)              # discard: settling
+
+    check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
+    dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+    check(dwf, dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_int(1)), "NodeEnableSet")
+    if STREAM_FUNC == "play":
+        # AnalogOut_Play.py: funcPlay, repeat 1, a finite run. Unbounded is
+        # approximated with a long run length.
+        check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(
+            hdwf, ch, AnalogOutNodeCarrier, funcPlay), "NodeFunctionSet")
+        check(dwf, dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(1)),
+              "RepeatSet")
+        check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch,
+                                           ctypes.c_double(STREAM_RUN_S)),
+              "RunSet")
+    else:
+        # AnalogOut_PlayTest.py: funcPlayPattern, run and repeat at defaults.
+        check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(
+            hdwf, ch, AnalogOutNodeCarrier, funcPlayPattern),
+            "NodeFunctionSet")
+    print(f"      streaming recipe {STREAM_FUNC!r}: "
+          + ("funcPlay, RepeatSet(1), RunSet("
+             f"{STREAM_RUN_S:.0f} s) -- AnalogOut_Play.py"
+             if STREAM_FUNC == "play"
+             else "funcPlayPattern, run/repeat default "
+                  "-- AnalogOut_PlayTest.py"))
+    check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(rate / scale)),
+        "FrequencySet")
+    scale_v = LEVEL * (2.0 if SOURCE_SERIES_75R else 1.0)
+    if STREAM_SQUARE:
+        amplitude, offset = 0.5, 0.0      # +/-0.45 V at the filler's +/-0.9
+    check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
+        hdwf, ch, AnalogOutNodeCarrier,
+        ctypes.c_double(amplitude * scale_v)), "AmplitudeSet")
+    check(dwf, dwf.FDwfAnalogOutNodeOffsetSet(
+        hdwf, ch, AnalogOutNodeCarrier,
+        ctypes.c_double(offset * scale_v)), "OffsetSet")
+    cbuf = ctypes.c_int(0)
+    check(dwf, dwf.FDwfAnalogOutNodeDataInfo(hdwf, ch, AnalogOutNodeCarrier, 0,
+                                             ctypes.byref(cbuf)), "DataInfo")
+    fifo = max(1, cbuf.value)
+    if STREAM_PAD:
+        # Wrap here, not earlier: the padding needs the FIFO size for its
+        # scratch buffer, and the prime must already be padded so the cadence
+        # starts in phase with the very first samples the device sees.
+        fill_fn = make_padded_filler(fill_fn, STREAM_PAD, STREAM_PAD_EVERY,
+                                     fifo)
+        print(f"      --stream-pad: {STREAM_PAD} hold samples every "
+              f"{STREAM_PAD_EVERY:,} real ones "
+              f"({STREAM_PAD / (STREAM_PAD_EVERY + STREAM_PAD) * 100:.4f}%), "
+              f"pre-compensating the\n      FIFO-wrap loss so the discarded "
+              f"block is padding rather than picture")
+    prime = (ctypes.c_double * fifo)()
+    fill_fn(prime, 0, fifo)
+    check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+        hdwf, ch, AnalogOutNodeCarrier, prime, ctypes.c_int(fifo)), "DataSet")
+    check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
+          "Configure")
+    report_output_window(dwf, hdwf, ch, amplitude * scale_v, offset * scale_v)
+
+    t = time.time()
+    probe = (ctypes.c_double * fifo)()
+    for _ in range(20):
+        fill_fn(probe, 12345, fifo)
+    gen = (time.time() - t) / 20
+    budget = fifo / rate
+    print(f"      FIFO {fifo:,} samples ({budget * 1000:.2f} ms budget); "
+          f"generating a chunk costs {gen * 1000:.3f} ms "
+          f"({gen / budget * 100:.1f}% of it)")
+    if gen > 0.30 * budget:
+        raise RuntimeError(
+            f"Chunk generation needs {gen * 1000:.3f} ms of a "
+            f"{budget * 1000:.2f} ms FIFO ({gen / budget * 100:.0f}%). The "
+            f"feed cannot keep up and every measurement taken this way would "
+            f"describe the starvation, not the device.")
+    if STREAM_RATE_CHECK:
+        print("      --stream-rate-check: paying 1792 us per poll for a "
+              "trustworthy `free`.\n"
+              "      This WILL underrun and break the picture. Diagnostic only.")
+    print("\nStreaming unbounded motion. Press Ctrl+C to stop.")
+    stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo,
+                rate_check=STREAM_RATE_CHECK, spl_hint=spl,
+                capture_at=STREAM_CAPTURE_AT, capture_path=SAVE_CAPTURE,
+                capture_s=STREAM_CAPTURE_S,
+                expect_sync_v=(V_BLANK - V_SYNC) * scale_v)
+    return total
+
+
+# Levels for the feed matrix. The primed and streamed data must be DIFFERENT
+# so the capture can say which one is actually playing. An API success code
+# cannot: config 3 returns success for every PlayData call and leaves W1 dead.
+FEED_PRIME_V = -0.5
+FEED_STREAM_V = +0.5
+
+
+# The two streaming recipes the SDK actually ships, quoted so the diff from
+# them stays visible. Our code matched NEITHER: it used funcPlay with
+# RunSet(0.0) and RepeatSet(0), and fed a chunk sized by a host-side budget
+# rather than by cFree. Writing more than cFree is an error, which is what
+# "PlayData refused" was.
+#
+#   AnalogOut_Play.py      funcPlay(31), RepeatSet(1), RunSet(duration)
+#   AnalogOut_PlayTest.py  funcPlayPattern(29), run/repeat left at defaults
+#
+# Both prime with the DataInfo buffer size, then feed EXACTLY cFree each
+# iteration and `continue` when cFree is 0.
+FEED_RECIPES = (
+    ("play+rep1+run", "AnalogOut_Play.py: funcPlay, RepeatSet(1), RunSet(s)"),
+    ("pattern+free", "AnalogOut_PlayTest.py: funcPlayPattern, defaults"),
+)
+
+
+def feed_one_config(dwf, cfg, recipe, target, secs=1.2):
+    """One configuration, one recipe. Returns (verdict, volts, fed, elapsed).
+
+    Primes DC at FEED_PRIME_V and streams DC at FEED_STREAM_V, so the capture
+    says which is playing -- a success code cannot.
+    """
+    hdwf = ctypes.c_int()
+    if dwf.FDwfDeviceConfigOpen(ctypes.c_int(0), ctypes.c_int(cfg),
+                                ctypes.byref(hdwf)) != 1 or hdwf.value == 0:
+        return None
+    try:
+        ch = ctypes.c_int(0)
+        setup_scope(dwf, hdwf)
+        dwf.FDwfAnalogOutReset(hdwf, ch)
+        dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+        dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
+                                       ctypes.c_int(1))
+        fn = funcPlay if recipe == "play+rep1+run" else funcPlayPattern
+        dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier, fn)
+        dwf.FDwfAnalogOutNodeFrequencySet(hdwf, ch, AnalogOutNodeCarrier,
+                                          ctypes.c_double(target))
+        dwf.FDwfAnalogOutNodeAmplitudeSet(hdwf, ch, AnalogOutNodeCarrier,
+                                          ctypes.c_double(1.0))
+        if recipe == "play+rep1+run":
+            dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(1))
+            dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(secs + 2.0))
+        # else: run and repeat left at their defaults, as PlayTest does
+
+        cbuf = ctypes.c_int(0)
+        dwf.FDwfAnalogOutNodeDataInfo(hdwf, ch, AnalogOutNodeCarrier, 0,
+                                      ctypes.byref(cbuf))
+        n_pre = max(1, cbuf.value)
+        primed = (ctypes.c_double * n_pre)()
+        for i in range(n_pre):
+            primed[i] = FEED_PRIME_V
+        if dwf.FDwfAnalogOutNodeDataSet(hdwf, ch, AnalogOutNodeCarrier,
+                                        primed, ctypes.c_int(n_pre)) != 1:
+            return ("DataSet refused", None, 0, 0.0, n_pre, 0)
+        if dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)) != 1:
+            return ("Configure refused", None, 0, 0.0, n_pre, 0)
+
+        SRC = 1 << 20
+        src = (ctypes.c_double * SRC)()
+        for i in range(SRC):
+            src[i] = FEED_STREAM_V
+        sts = ctypes.c_ubyte()
+        free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        fed = 0
+        t_lost = t_corr = 0
+        free_max = 0
+        note = ""
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            if dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts)) != 1:
+                note = "Status error"
+                break
+            if sts.value != DwfStateRunning:
+                note = (f"left running ({DWF_STATE_NAMES.get(sts.value, sts.value)})")
+                break
+            dwf.FDwfAnalogOutNodePlayStatus(hdwf, ch, AnalogOutNodeCarrier,
+                                            ctypes.byref(free),
+                                            ctypes.byref(lost),
+                                            ctypes.byref(corrupt))
+            t_lost += lost.value
+            t_corr += corrupt.value
+            free_max = max(free_max, free.value)
+            if free.value == 0:
+                continue
+            # Exactly cFree, clamped to our source buffer -- as both examples
+            # do. Feeding more than cFree is an error.
+            n = min(free.value, SRC)
+            if dwf.FDwfAnalogOutNodePlayData(hdwf, ch, AnalogOutNodeCarrier,
+                                             src, ctypes.c_int(n)) != 1:
+                note = "PlayData refused"
+                break
+            fed += n
+        el = time.time() - t0
+
+        s = capture(dwf, hdwf, 1e6, 1 << 13)
+        v = sorted(s)[len(s) // 2]
+        if abs(v - FEED_STREAM_V) < 0.15:
+            verdict = "STREAM on output"
+        elif abs(v - FEED_PRIME_V) < 0.15:
+            verdict = "looping prime"
+        elif abs(v) < 0.1:
+            verdict = "W1 dead"
+        else:
+            verdict = f"odd {v:+.2f} V"
+        if note:
+            verdict += f" [{note}]"
+        return (verdict, v, fed, el, n_pre, free_max, t_lost, t_corr)
+    finally:
+        dwf.FDwfDeviceClose(hdwf)
+
+
+enumfilterAll = ctypes.c_int(0)
+enumfilterUSB = ctypes.c_int(1)
+enumfilterNetwork = ctypes.c_int(2)
+
+
+def memory_probe(dwf):
+    """Can analogout-memory deepen the streaming FIFO past 32,768 samples?
+
+    The measurements leave a closed trap. PlayData costs a flat ~1077 us
+    whatever its size, and a trustworthy `free` needs AnalogOutStatus at
+    ~1393 us, so the documented loop takes ~2470 us per pass while the FIFO
+    holds only 2294 us of samples at the colour rate. The buffer empties
+    before the next refill can arrive, which caps the documented loop at
+    13.3 MS/s. Dropping AnalogOutStatus fits the loop but leaves `free`
+    permanently stale, so the fill becomes an estimate and drifting low means
+    writing into a nearly-full FIFO, which is where the 32-sample block losses
+    come from.
+
+    A deeper FIFO breaks the trap, and the manual documents the knob:
+    FDwfDeviceOpenEx takes "analogout-memory:#", the memory allocated to the
+    analog-out instruments in BYTES.
+    """
+    ndev, ncfg = ctypes.c_int(), ctypes.c_int()
+    check(dwf, dwf.FDwfEnum(ctypes.c_int(0), ctypes.byref(ndev)), "FDwfEnum")
+    check(dwf, dwf.FDwfEnumConfig(ctypes.c_int(0), ctypes.byref(ncfg)),
+          "FDwfEnumConfig")
+    cfg, best = -1, -1
+    for i in range(ncfg.value):
+        play, scope = ctypes.c_int(), ctypes.c_int()
+        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogOutPlaySize,
+                               ctypes.byref(play))
+        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogInBufferSize,
+                               ctypes.byref(scope))
+        if play.value == 0 and scope.value > best:
+            cfg, best = i, scope.value
+    if cfg < 0:
+        raise RuntimeError("No streaming configuration found.")
+    print(f"\nanalogout-memory probe, streaming configuration {cfg}")
+    print(f"  FIFO must exceed {100e6 / 7 * 0.00247:,.0f} samples for the "
+          f"documented loop to fit (2470 us at 14.286 MS/s)")
+    print(f"\n  {'analogout-memory':>18} {'DataInfo max':>13} "
+          f"{'PlayInfo max':>13} {'free after prime':>17} {'FIFO ms':>8}")
+    rate = 100e6 / 7
+    for mib in (None, 16, 64, 128, 256, 512):
+        opts = [f"config:{cfg}"]
+        if mib is not None:
+            opts.append(f"analogout-memory:{mib * 1024 * 1024}")
+        hdwf = ctypes.c_int()
+        ok = False
+        for sep in (" ", ","):
+            o = sep.join(opts).encode()
+            if dwf.FDwfDeviceOpenEx(o, ctypes.byref(hdwf)) == 1 \
+                    and hdwf.value != 0:
+                ok = True
+                break
+        label = "default" if mib is None else f"{mib} MiB"
+        if not ok:
+            print(f"  {label:>18} open refused: {last_error(dwf)[:40]}")
+            continue
+        try:
+            ch = ctypes.c_int(0)
+            dmin, dmax = ctypes.c_int(), ctypes.c_int()
+            pmin, pmax = ctypes.c_int(), ctypes.c_int()
+            dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+            dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
+                                           ctypes.c_int(1))
+            dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier,
+                                             funcPlayPattern)
+            dwf.FDwfAnalogOutNodeFrequencySet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_double(rate))
+            dwf.FDwfAnalogOutNodeAmplitudeSet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_double(1.0))
+            dwf.FDwfAnalogOutNodeDataInfo(hdwf, ch, AnalogOutNodeCarrier,
+                                          ctypes.byref(dmin),
+                                          ctypes.byref(dmax))
+            dwf.FDwfAnalogOutNodePlayInfo(hdwf, ch, AnalogOutNodeCarrier,
+                                          ctypes.byref(pmin),
+                                          ctypes.byref(pmax))
+            n = max(1, dmax.value)
+            pre = (ctypes.c_double * n)()
+            dwf.FDwfAnalogOutNodeDataSet(hdwf, ch, AnalogOutNodeCarrier, pre,
+                                         ctypes.c_int(n))
+            dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(0.0))
+            freev = ctypes.c_int(-1)
+            if dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)) == 1:
+                sts = ctypes.c_ubyte()
+                lost, corr = ctypes.c_int(), ctypes.c_int()
+                dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts))
+                dwf.FDwfAnalogOutNodePlayStatus(
+                    hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(freev),
+                    ctypes.byref(lost), ctypes.byref(corr))
+            depth = max(dmax.value, freev.value)
+            print(f"  {label:>18} {dmax.value:>13,} {pmax.value:>13,} "
+                  f"{freev.value:>17,} {depth / rate * 1000:>8.2f}")
+        finally:
+            dwf.FDwfAnalogOutReset(hdwf, ctypes.c_int(0))
+            dwf.FDwfDeviceClose(hdwf)
+    print("\n  If DataInfo max or free grows with the option, the documented")
+    print("  loop becomes possible and the block losses should disappear.")
+
+
+def transport_info(dwf):
+    """Which transport is the device on, and what does a round trip cost?
+
+    FDwfAnalogOutStatus measured 1792-1881 us on this device. For USB that is
+    absurd -- a status read should be tens of microseconds -- and the SDK's own
+    documented feed loop calls it once per iteration, which is why that loop
+    tops out near 1-2 MS/s here. A network hop would explain the figure
+    exactly, and Digilent's forums carry reports of streaming discontinuities
+    specific to Ethernet. enumfilterUSB and enumfilterNetwork settle it.
+    """
+    print("\nTransport:")
+    # enumfilterUSB (1) and enumfilterNetwork (2) collide with the legacy
+    # device-type values enumfilterEExplorer (1) and enumfilterDiscovery (2),
+    # so the SDK reads them as type filters and an ADP2230 matches neither --
+    # both came back 0 while enumfilterAll found the device. The transport
+    # cannot be determined this way; the per-call timings below settle what
+    # actually matters anyway.
+    found = {}
+    for name, filt in (("USB?", enumfilterUSB),
+                       ("Network?", enumfilterNetwork),
+                       ("all", enumfilterAll)):
+        n = ctypes.c_int()
+        if dwf.FDwfEnum(filt, ctypes.byref(n)) != 1:
+            print(f"  {name:8} enumeration failed: {last_error(dwf)}")
+            continue
+        found[name] = n.value
+        names = []
+        for i in range(n.value):
+            nb, sb = (ctypes.create_string_buffer(64),
+                      ctypes.create_string_buffer(64))
+            dwf.FDwfEnumDeviceName(ctypes.c_int(i), nb)
+            dwf.FDwfEnumSN(ctypes.c_int(i), sb)
+            names.append(f"{nb.value.decode()} {sb.value.decode()}")
+        print(f"  {name:8} {n.value} device(s)"
+              + ("".join(f"\n             {x}" for x in names) if names
+                 else ""))
+
+    print("  (the USB/Network filter values are ambiguous in this SDK; "
+          "ignore those two rows)")
+
+    # Time a round trip on whatever the default open gives us.
+    hdwf = ctypes.c_int()
+    if dwf.FDwfDeviceOpen(ctypes.c_int(-1), ctypes.byref(hdwf)) != 1 \
+            or hdwf.value == 0:
+        print(f"  could not open a device: {last_error(dwf)}")
+        return found
+    try:
+        ch = ctypes.c_int(0)
+        sts = ctypes.c_ubyte()
+        free, lost, corr = (ctypes.c_int(), ctypes.c_int(), ctypes.c_int())
+        for label, fn in (
+                ("FDwfAnalogOutStatus",
+                 lambda: dwf.FDwfAnalogOutStatus(hdwf, ch,
+                                                 ctypes.byref(sts))),
+                ("FDwfAnalogOutNodePlayStatus",
+                 lambda: dwf.FDwfAnalogOutNodePlayStatus(
+                     hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                     ctypes.byref(lost), ctypes.byref(corr))),
+                ("FDwfDeviceParamGet",
+                 lambda: dwf.FDwfDeviceParamGet(
+                     hdwf, DwfParamFrequency, ctypes.byref(free)))):
+            t = time.time()
+            for _ in range(200):
+                fn()
+            us = (time.time() - t) / 200 * 1e6
+            print(f"  {label:30} {us:8.1f} us  "
+                  f"({1e6 / us:7.0f} calls/s)")
+        print("  PlayStatus and ParamGet at ~1 us are LOCAL reads of state "
+              "that\n  AnalogOutStatus fetched and cached -- which is why "
+              "PlayStatus goes\n  stale without it, exactly as the manual's "
+              "call order implies.")
+
+        # The one call never timed. If a bulk write costs milliseconds, that
+        # is the real throughput ceiling, not AnalogOutStatus.
+        rate = 100e6 / 7
+        dwf.FDwfAnalogOutReset(hdwf, ch)
+        dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+        dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
+                                       ctypes.c_int(1))
+        dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier,
+                                         funcPlayPattern)
+        dwf.FDwfAnalogOutNodeFrequencySet(hdwf, ch, AnalogOutNodeCarrier,
+                                          ctypes.c_double(rate))
+        dwf.FDwfAnalogOutNodeAmplitudeSet(hdwf, ch, AnalogOutNodeCarrier,
+                                          ctypes.c_double(1.0))
+        cb = ctypes.c_int()
+        dwf.FDwfAnalogOutNodeDataInfo(hdwf, ch, AnalogOutNodeCarrier, 0,
+                                      ctypes.byref(cb))
+        pre = (ctypes.c_double * max(1, cb.value))()
+        dwf.FDwfAnalogOutNodeDataSet(hdwf, ch, AnalogOutNodeCarrier, pre,
+                                     ctypes.c_int(len(pre)))
+        if dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)) != 1:
+            print(f"\n  could not start play mode: {last_error(dwf)}")
+            return found
+        src = (ctypes.c_double * (1 << 16))()
+        print(f"\n  FDwfAnalogOutNodePlayData cost by size "
+              f"(FIFO is {len(pre):,}):")
+        print(f"    {'samples':>8} {'us/call':>9} {'MS/s if that were the '
+              'only cost':>38}")
+        for n in (1024, 4096, 8192, 16384, 32768):
+            if n > len(src):
+                continue
+            # Keep the FIFO fed so the call is not blocking on a full buffer.
+            dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts))
+            dwf.FDwfAnalogOutNodePlayStatus(
+                hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                ctypes.byref(lost), ctypes.byref(corr))
+            if free.value < n:
+                print(f"    {n:>8,} {'':>9}  only {free.value:,} free, "
+                      f"skipped")
+                continue
+            t = time.time()
+            reps = 0
+            while reps < 20:
+                if dwf.FDwfAnalogOutNodePlayData(
+                        hdwf, ch, AnalogOutNodeCarrier, src,
+                        ctypes.c_int(n)) != 1:
+                    break
+                reps += 1
+                dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts))
+                dwf.FDwfAnalogOutNodePlayStatus(
+                    hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                    ctypes.byref(lost), ctypes.byref(corr))
+                if free.value < n:
+                    break
+            if not reps:
+                print(f"    {n:>8,} refused")
+                continue
+            us = (time.time() - t) / reps * 1e6
+            # subtract the status pair we had to interleave
+            us_pd = max(0.0, us - 1625.0)
+            print(f"    {n:>8,} {us_pd:>9.1f} {n / max(us_pd, 1e-9):>38.2f}")
+        dwf.FDwfAnalogOutReset(hdwf, ch)
+    finally:
+        dwf.FDwfDeviceClose(hdwf)
+    return found
+
+
+def feed_matrix(dwf, target=100e6 / 7):
+    """Configuration x recipe: which combination puts a stream on W1?
+
+    Needs W1 -> CH1. The question this answers is the one that blocks feeding
+    arbitrary data: does PlayData reach the output, under the call sequences
+    the SDK's own examples use, and at what rate.
+    """
+    ndev = ctypes.c_int()
+    check(dwf, dwf.FDwfEnum(ctypes.c_int(0), ctypes.byref(ndev)), "FDwfEnum")
+    if ndev.value == 0:
+        raise RuntimeError("No Digilent device found. Close WaveForms and "
+                           "replug.")
+    name, sn = ctypes.create_string_buffer(32), ctypes.create_string_buffer(32)
+    dwf.FDwfEnumDeviceName(ctypes.c_int(0), name)
+    dwf.FDwfEnumSN(ctypes.c_int(0), sn)
+    print(f"  device 0: {name.value.decode()} {sn.value.decode()}")
+    ncfg = ctypes.c_int()
+    check(dwf, dwf.FDwfEnumConfig(ctypes.c_int(0), ctypes.byref(ncfg)),
+          "FDwfEnumConfig")
+
+    print(f"\nFeed matrix: prime DC {FEED_PRIME_V:+.2f} V, stream DC "
+          f"{FEED_STREAM_V:+.2f} V at {target / 1e6:.3f} MS/s. "
+          f"Needs W1 -> CH1.")
+    for key, desc in FEED_RECIPES:
+        print(f"  {key:16} {desc}")
+    good = []
+    for key, _ in FEED_RECIPES:
+        print(f"\n  recipe {key}")
+        print(f"    {'cfg':>3} {'play mem':>12} {'prefill':>8} {'free max':>10} "
+              f"{'MS/s':>8} {'CH1':>7}  verdict")
+        for i in range(ncfg.value):
+            play = ctypes.c_int()
+            dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogOutPlaySize,
+                                   ctypes.byref(play))
+            r = feed_one_config(dwf, i, key, target)
+            if r is None:
+                print(f"    {i:>3} {play.value:>12,} "
+                      f"{'':>8} {'':>10} {'':>8} {'':>7}  could not open")
+                continue
+            verdict, v, fed, el, n_pre, fmax = r[0], r[1], r[2], r[3], r[4], r[5]
+            ms = f"{fed / el / 1e6:8.3f}" if el > 0 else f"{'':>8}"
+            vs = f"{v:+7.3f}" if v is not None else f"{'':>7}"
+            print(f"    {i:>3} {play.value:>12,} {n_pre:>8,} {fmax:>10,} "
+                  f"{ms} {vs}  {verdict}")
+            if verdict.startswith("STREAM"):
+                good.append((key, i, fed / el / 1e6))
+    print()
+    if not good:
+        print("  Nothing streamed reached W1 under either documented recipe.")
+        return good
+    print("  Combinations that put the stream on the output:")
+    for key, i, ms in good:
+        head = ms / (target / 1e6)
+        print(f"    {key} config {i}: {ms:.3f} MS/s = {head:.2f}x the "
+              f"{target / 1e6:.3f} MS/s colour rate"
+              + ("" if head >= 1.0 else "  -- short for colour"))
+    return good
+
+
+# Loop structures to try in a streaming configuration. The examples use the
+# three-call form; the question is whether dropping calls buys enough rate,
+# because sustaining R with a FIFO of D samples needs a loop period under
+# D/R -- 2.29 ms for 32768 samples at the colour rate.
+FEED_LOOPS = (
+    ("3call", "Status + PlayStatus + PlayData (as the SDK examples)"),
+    ("2call", "PlayStatus + PlayData (drop AnalogOutStatus)"),
+    ("paced", "PlayData only, fill tracked against the clock, "
+              "PlayStatus every 100 ms to resync"),
+)
+
+
+def feed_tune(dwf, secs=1.2):
+    """Maximum sustainable PlayData rate in a streaming configuration.
+
+    Streaming only works where play memory is 0 (measured by --feed-matrix),
+    and those configurations have a FIFO of roughly 32768 samples. So the rate
+    ceiling is FIFO depth divided by loop period, and the loop period is
+    dominated by USB round trips. This measures the round trip in the chosen
+    configuration -- the 1413 us figure came from config 3 and may not apply --
+    then sweeps loop structure against target rate, checking the output each
+    time rather than trusting the counters.
+    """
+    ndev, ncfg = ctypes.c_int(), ctypes.c_int()
+    check(dwf, dwf.FDwfEnum(ctypes.c_int(0), ctypes.byref(ndev)), "FDwfEnum")
+    check(dwf, dwf.FDwfEnumConfig(ctypes.c_int(0), ctypes.byref(ncfg)),
+          "FDwfEnumConfig")
+    cfg, best_scope = -1, -1
+    for i in range(ncfg.value):
+        play, scope = ctypes.c_int(), ctypes.c_int()
+        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogOutPlaySize,
+                               ctypes.byref(play))
+        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogInBufferSize,
+                               ctypes.byref(scope))
+        if play.value == 0 and scope.value > best_scope:
+            cfg, best_scope = i, scope.value
+    if cfg < 0:
+        raise RuntimeError("No configuration with play memory 0; none of them "
+                           "can stream. Run --feed-matrix.")
+    print(f"  streaming configuration {cfg} (play memory 0, scope buffer "
+          f"{best_scope:,})")
+
+    hdwf = ctypes.c_int()
+    check(dwf, dwf.FDwfDeviceConfigOpen(ctypes.c_int(0), ctypes.c_int(cfg),
+                                        ctypes.byref(hdwf)), "ConfigOpen")
+    try:
+        ch = ctypes.c_int(0)
+        setup_scope(dwf, hdwf)
+        sts = ctypes.c_ubyte()
+        free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+
+        # Round trip in THIS configuration, per call type.
+        def timeit(fn, n=150):
+            t = time.time()
+            for _ in range(n):
+                fn()
+            return (time.time() - t) / n
+        rt_s = timeit(lambda: dwf.FDwfAnalogOutStatus(hdwf, ch,
+                                                      ctypes.byref(sts)))
+        rt_p = timeit(lambda: dwf.FDwfAnalogOutNodePlayStatus(
+            hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+            ctypes.byref(lost), ctypes.byref(corrupt)))
+        print(f"  round trip here: AnalogOutStatus {rt_s * 1e6:.0f} us, "
+              f"PlayStatus {rt_p * 1e6:.0f} us")
+
+        SRC = 1 << 18
+        src = (ctypes.c_double * SRC)()
+        for i in range(SRC):
+            src[i] = FEED_STREAM_V
+
+        def arm(target):
+            dwf.FDwfAnalogOutReset(hdwf, ch)
+            dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+            dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
+                                           ctypes.c_int(1))
+            dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier,
+                                             funcPlayPattern)
+            dwf.FDwfAnalogOutNodeFrequencySet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_double(target))
+            dwf.FDwfAnalogOutNodeAmplitudeSet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_double(1.0))
+            cbuf = ctypes.c_int(0)
+            dwf.FDwfAnalogOutNodeDataInfo(hdwf, ch, AnalogOutNodeCarrier, 0,
+                                          ctypes.byref(cbuf))
+            pre = (ctypes.c_double * max(1, cbuf.value))()
+            for i in range(len(pre)):
+                pre[i] = FEED_PRIME_V
+            dwf.FDwfAnalogOutNodeDataSet(hdwf, ch, AnalogOutNodeCarrier, pre,
+                                         ctypes.c_int(len(pre)))
+            dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1))
+            return len(pre)
+
+        def run(kind, target):
+            arm(target)
+            fed = t_lost = t_corr = 0
+            depth = 1 << 15                 # refined from observed cFree
+            t0 = time.time()
+            t_poll = 0.0
+            fill = 0.0
+            err = ""
+            while True:
+                now = time.time() - t0
+                if now >= secs:
+                    break
+                if kind == "3call":
+                    if dwf.FDwfAnalogOutStatus(hdwf, ch,
+                                               ctypes.byref(sts)) != 1:
+                        err = "Status error"; break
+                    if sts.value != DwfStateRunning:
+                        err = DWF_STATE_NAMES.get(sts.value, "?"); break
+                if kind in ("3call", "2call"):
+                    dwf.FDwfAnalogOutNodePlayStatus(
+                        hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                        ctypes.byref(lost), ctypes.byref(corrupt))
+                    t_lost += lost.value
+                    t_corr += corrupt.value
+                    depth = max(depth, free.value)
+                    n = min(free.value, SRC)
+                else:
+                    if now >= t_poll:
+                        dwf.FDwfAnalogOutNodePlayStatus(
+                            hdwf, ch, AnalogOutNodeCarrier,
+                            ctypes.byref(free), ctypes.byref(lost),
+                            ctypes.byref(corrupt))
+                        t_lost += lost.value
+                        t_corr += corrupt.value
+                        depth = max(depth, free.value)
+                        fill = depth - free.value     # resync to the truth
+                        t_poll = now + 0.1
+                    else:
+                        fill = max(0.0, fed - now * target)
+                    n = int(min(depth - fill, SRC))
+                if n <= 0:
+                    continue
+                if dwf.FDwfAnalogOutNodePlayData(
+                        hdwf, ch, AnalogOutNodeCarrier, src,
+                        ctypes.c_int(n)) != 1:
+                    err = "PlayData refused"; break
+                fed += n
+            el = time.time() - t0
+            s = capture(dwf, hdwf, 1e6, 1 << 13)
+            v = sorted(s)[len(s) // 2]
+            return fed / el / 1e6, t_lost, t_corr, v, depth, err
+
+        # Sweep PAST the colour rate. The earlier sweep stopped at 14.286 and
+        # reported "achievable", which told us nothing about the margin -- and
+        # the margin is what decides whether occasional host hiccups turn into
+        # dropouts.
+        targets = (1e6, 5e6, 11e6, 100e6 / 7, 16e6, 20e6, 25e6, 30e6)
+        print("\n  Throughput only -- DC cannot reveal dropped samples, and "
+              "the counters\n  read 0 on a stream that was measurably "
+              "corrupted. Integrity needs\n  --stream-capture on the real "
+              "waveform.")
+        print(f"\n  {'loop':6} {'target':>9} {'achieved':>9} {'lost':>8} "
+              f"{'corrupt':>8} {'CH1':>7} {'depth':>8}  verdict")
+        best = {}
+        for kind, _ in FEED_LOOPS:
+            for tg in targets:
+                ms, lo, co, v, depth, err = run(kind, tg)
+                ok = (not err and lo == 0 and co == 0
+                      and abs(v - FEED_STREAM_V) < 0.15
+                      and ms >= tg / 1e6 * 0.999)
+                if ok:
+                    best[kind] = max(best.get(kind, 0.0), tg / 1e6)
+                # "meets rate", NOT "clean": this streams DC, and a dropped
+                # or duplicated DC sample is indistinguishable from a kept
+                # one. lost and corrupt both read 0 on a stream that a direct
+                # capture showed had 179 us of jitter and 28 bad lines in 607.
+                # So this measures THROUGHPUT only. Signal integrity has to be
+                # measured on the real waveform, with --stream-capture.
+                short = max(0.0, tg / 1e6 - ms) * 1e6
+                verdict = err or ("meets rate" if ok else
+                                  f"short {short / 908:.0f} lines/s")
+                print(f"  {kind:6} {tg / 1e6:9.3f} {ms:9.3f} {lo:>8,} "
+                      f"{co:>8,} {v:+7.3f} {depth:>8,}  {verdict}")
+        print()
+        need = 100e6 / 7 / 1e6
+        for kind, desc in FEED_LOOPS:
+            b = best.get(kind, 0.0)
+            print(f"  {kind:6} max clean {b:6.3f} MS/s "
+                  f"({b / need:4.2f}x colour)  {desc}")
+        top = max(best.values()) if best else 0.0
+        print()
+        if top >= need:
+            print(f"  Colour streaming is achievable at {top:.3f} MS/s.")
+        else:
+            print(f"  Best clean rate {top:.3f} MS/s against "
+                  f"{need:.3f} needed for colour.")
+            print(f"  Monochrome needs far less: 54 samples/line is "
+                  f"{54 * 15734 / 1e6:.3f} MS/s, 370 is "
+                  f"{370 * 15734 / 1e6:.3f} MS/s.")
+        return best
+    finally:
+        dwf.FDwfDeviceClose(hdwf)
+
+
+def stream_probe(dwf, hdwf, ch, target=100e6 / 7):
+    """Measure sustainable PlayData throughput, and say what limits it.
+
+    The feed loop is already synthesis-free and zero-copy, so if it cannot
+    reach the colour rate the cost is per-call overhead, not host compute --
+    and no amount of C or Rust changes that. What decides it is how many
+    samples the device reports free per round trip, so this sweeps chunk size
+    and times each API call separately:
+
+      latency-bound   PlayData time stays flat as the chunk grows; the fixed
+                      cost of the round trips dominates. Bigger chunks win.
+      bandwidth-bound PlayData time scales with the chunk. The wire is full
+                      and the rate is the ceiling.
+    """
+    scale = PLAY_SCALE_OVERRIDE or 1.0
+    print(f"\nPlayData throughput probe (target {target / 1e6:.6f} MS/s "
+          f"for colour, scale {scale:.3f}x)")
+
+    # A cheap ramp: content is irrelevant to throughput, and synthesising a
+    # real sequence here would only slow the setup down.
+    SRC = 1 << 22                                 # 4 Mi samples, 32 MB
+    src = (ctypes.c_double * SRC)()
+    for i in range(SRC):
+        src[i] = -1.0 + 2.0 * (i / (SRC - 1))
+
+    sts = ctypes.c_ubyte()
+    free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+
+    # Fixed cost of a single round trip, with nothing else going on.
+    t = time.time()
+    for _ in range(200):
+        dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts))
+    rt = (time.time() - t) / 200
+    print(f"  round trip: AnalogOutStatus {rt * 1e6:.1f} us "
+          f"-> {1.0 / rt:.0f} calls/s ceiling per transaction")
+
+    print(f"\n  {'chunk':>9} {'MS/s':>8} {'iters/s':>8} {'free avg':>9} "
+          f"{'free max':>9} {'PlayData':>9} {'status':>8} {'lost':>7} {'corr':>6}")
+    best = (0.0, 0)
+    for cap in (1 << 12, 1 << 14, 1 << 16, 1 << 18, 1 << 20, 1 << 22):
+        check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "Reset")
+        dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+        for fn, a in ((dwf.FDwfAnalogOutNodeEnableSet, ctypes.c_int(1)),
+                      (dwf.FDwfAnalogOutNodeFunctionSet, funcPlay)):
+            check(dwf, fn(hdwf, ch, AnalogOutNodeCarrier, a), "node setup")
+        check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
+            hdwf, ch, AnalogOutNodeCarrier,
+            ctypes.c_double(target / scale)), "FrequencySet")
+        check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
+            hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(1.0)),
+            "AmplitudeSet")
+        check(dwf, dwf.FDwfAnalogOutNodeOffsetSet(
+            hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(0.0)),
+            "OffsetSet")
+        # Prime with a chunk, then run unbounded and append.
+        prime = min(SRC, 1 << 20)
+        check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+            hdwf, ch, AnalogOutNodeCarrier, src, ctypes.c_int(prime)),
+            "DataSet")
+        check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(0.0)),
+              "RunSet")
+        check(dwf, dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(0)),
+              "RepeatSet")
+        check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
+              "Configure")
+
+        pos = 0
+        fed = iters = fsum = fmax = 0
+        t_pd = t_st = 0.0
+        t_lost = t_corr = 0
+        t0 = time.time()
+        while time.time() - t0 < 2.5:
+            ta = time.time()
+            check(dwf, dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts)),
+                  "AnalogOutStatus")
+            check(dwf, dwf.FDwfAnalogOutNodePlayStatus(
+                hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                ctypes.byref(lost), ctypes.byref(corrupt)), "PlayStatus")
+            tb = time.time()
+            t_st += tb - ta
+            t_lost += lost.value
+            t_corr += corrupt.value
+            fsum += free.value
+            fmax = max(fmax, free.value)
+            want = min(free.value, cap, SRC - pos)
+            if want > 0:
+                check(dwf, dwf.FDwfAnalogOutNodePlayData(
+                    hdwf, ch, AnalogOutNodeCarrier,
+                    ctypes.byref(src, pos * 8), ctypes.c_int(want)),
+                    "PlayData")
+                t_pd += time.time() - tb
+                pos = (pos + want) % SRC
+                fed += want
+            iters += 1
+        el = time.time() - t0
+        ms = fed / el / 1e6
+        if ms > best[0]:
+            best = (ms, cap)
+        print(f"  {cap:>9,} {ms:>8.3f} {iters / el:>8.0f} "
+              f"{fsum / max(iters, 1):>9,.0f} {fmax:>9,} "
+              f"{t_pd / el * 100:>8.1f}% {t_st / el * 100:>7.1f}% "
+              f"{t_lost:>7,} {t_corr:>6,}")
+    dwf.FDwfAnalogOutReset(hdwf, ch)
+
+    ms, cap = best
+    print(f"\n  best {ms:.3f} MS/s at chunk {cap:,} "
+          f"({ms / (target / 1e6) * 100:.0f}% of the {target / 1e6:.3f} MS/s "
+          f"colour rate)")
+    if ms >= target / 1e6:
+        print("  VERDICT: unbounded streaming at the colour rate is viable.")
+    else:
+        need = target / 1e6 / max(ms, 1e-9)
+        print(f"  VERDICT: short by {need:.2f}x. Unbounded colour streaming is\n"
+              f"           not sustainable at this chunk size. Options: a long\n"
+              f"           deep-memory loop (9.34 s), or a lower sample rate.")
+    return ms
+
 def main():
     argv = sys.argv[1:]
 
@@ -2744,13 +5111,17 @@ def main():
     flags = {"--help", "-h",
              # generation
              "--deep", "--stream", "--color", "--progressive", "--locked",
-             "--run-infinite", "--series-75", "--max-res",
+             "--run-infinite", "--series-75", "--max-res", "--motion",
+             "--motion-stream", "--stream-rate-check", "--stream-static",
+             "--stream-doc",
              # measurement
              "--dump", "--verify", "--analyze", "--scan", "--compare",
              "--capture",
              # device capability probes
              "--play-info", "--play-test", "--play-configs", "--pattern-info",
-             "--clock-info",
+             "--clock-info", "--stream-probe", "--feed-matrix",
+             "--feed-tune", "--transport", "--memory-probe",
+             "--dual-probe", "--dual-sacrificial", "--dual",
              # A/B switches for things that were tested and are documented
              "--no-filter", "--sync-tip-zero", "--vbi-black",
              "--no-loop-align", "--fsc-nominal"}
@@ -2758,7 +5129,11 @@ def main():
             "--stream-rate", "--play-scale", "--config", "--sat",
             "--sys-clock", "--capture", "--seconds", "--level",
             "--burst-start", "--burst-amp", "--copies", "--setup",
-            "--bar-amp"}
+            "--bar-amp", "--motion-seconds", "--stream-capture",
+            "--stream-func", "--stream-align", "--stream-resync",
+            "--stream-guard", "--stream-capture-s", "--stream-div",
+            "--stream-square", "--stream-pad", "--stream-pad-every",
+            "--dual-buffer", "--dual-hz", "--dual-change", "--dual-seq"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -2790,7 +5165,10 @@ def main():
     global FILTER_CHROMA, STD_DC, FSC_NOMINAL, SYS_CLOCK, LOOP_ALIGN
     global VBI_BLACK, LEVEL, BURST_START_US, BURST_AMP
     global RUN_INFINITE, COPIES
-    global SOURCE_SERIES_75R
+    global SOURCE_SERIES_75R, MOTION_SECONDS, STREAM_RATE_CHECK
+    global STREAM_CAPTURE_AT, STREAM_FUNC, STREAM_STATIC, STREAM_ALIGN
+    global STREAM_RESYNC_S, STREAM_GUARD, STREAM_CAPTURE_S, STREAM_SQUARE
+    global STREAM_DOC, STREAM_PAD, STREAM_PAD_EVERY, DUAL_SEQ
     # --locked: the combination measured to lock a Leader LV5700A through a
     # vectorscope-and-monitor chain. Individual flags still override it.
     if "--locked" in argv:
@@ -2807,6 +5185,25 @@ def main():
               f"at {BURST_START_US} us, infinite run")
     set_setup_ire(opt("--setup", float, SETUP_IRE))
     set_bar_amp(opt("--bar-amp", float, BAR_AMP * 100.0))
+    STREAM_RATE_CHECK = "--stream-rate-check" in argv
+    STREAM_CAPTURE_AT = opt("--stream-capture", float, None)
+    STREAM_STATIC = "--stream-static" in argv
+    STREAM_ALIGN = max(1, opt("--stream-align", int, 1))
+    STREAM_RESYNC_S = opt("--stream-resync", float, STREAM_RESYNC_S)
+    STREAM_GUARD = max(0, opt("--stream-guard", int, STREAM_GUARD))
+    STREAM_CAPTURE_S = opt("--stream-capture-s", float, STREAM_CAPTURE_S)
+    STREAM_SQUARE = max(0, opt("--stream-square", int, 0))
+    STREAM_DOC = "--stream-doc" in argv
+    DUAL_SEQ = max(1, opt("--dual-seq", int, DUAL_SEQ))
+    STREAM_PAD = max(0, opt("--stream-pad", int, 0))
+    STREAM_PAD_EVERY = max(1, opt("--stream-pad-every", int,
+                                  STREAM_PAD_EVERY))
+    STREAM_FUNC = opt("--stream-func", str, STREAM_FUNC)
+    if STREAM_FUNC not in ("play", "pattern"):
+        raise RuntimeError("--stream-func must be 'play' or 'pattern'.")
+    MOTION_SECONDS = opt("--motion-seconds", float, MOTION_SECONDS)
+    if MOTION_SECONDS <= 0:
+        raise RuntimeError("--motion-seconds must be positive.")
     VBI_BLACK = "--vbi-black" in argv
     LOOP_ALIGN = "--no-loop-align" not in argv
     SYS_CLOCK = opt("--sys-clock", float, None)
@@ -2828,6 +5225,20 @@ def main():
 
     if "--color" in argv and not ({"--deep", "--stream"} & set(argv)):
         raise RuntimeError("--color needs --deep (recommended) or --stream.")
+    if "--motion-stream" in argv and "--motion" not in argv:
+        raise RuntimeError("--motion-stream selects the feed path for "
+                           "--motion; pass --motion as well.")
+    if "--motion" in argv:
+        if "--deep" not in argv or "--color" not in argv:
+            raise RuntimeError("--motion needs --deep --color: it streams a "
+                               "ball over the colour bars from play memory.")
+        bad = {"--analyze", "--scan", "--verify"} & set(argv)
+        if bad:
+            raise RuntimeError(
+                f"--motion cannot be combined with {' '.join(sorted(bad))}: "
+                f"those capture CH1 while the feed loop must keep play memory "
+                f"topped up, and a stalled feed corrupts the output. Analyse "
+                f"the static signal instead (drop --motion).")
     if "--color" in argv and "--stream" in argv:
         print("NOTE: --stream feeds chunks via PlayData and measured ~5.8 MS/s\n"
               "      sustained; colour needs 14.3 MS/s, so expect starvation.\n"
@@ -2852,6 +5263,22 @@ def main():
         pattern_info(dwf)
         return
 
+    if "--transport" in argv:
+        transport_info(dwf)
+        return
+
+    if "--memory-probe" in argv:
+        memory_probe(dwf)
+        return
+
+    if "--feed-matrix" in argv:
+        feed_matrix(dwf)
+        return
+
+    if "--feed-tune" in argv:
+        feed_tune(dwf)
+        return
+
     if "--play-configs" in argv:
         play_configs(dwf)
         return
@@ -2863,7 +5290,9 @@ def main():
         return
 
     print("Enumerating...")
-    if "--deep" in argv:
+    if "--motion-stream" in argv:
+        cfg = pick_stream_config(dwf, force=opt("--config", int, None))
+    elif "--deep" in argv:
         cfg = pick_deep_config(dwf, force=opt("--config", int, None))
     else:
         cfg = pick_config(dwf, for_stream="--stream" in argv,
@@ -2879,6 +5308,10 @@ def main():
     try:
         if "--play-test" in argv:
             play_test(dwf, hdwf, ch)
+            return
+
+        if "--stream-probe" in argv:
+            stream_probe(dwf, hdwf, ch)
             return
 
         if "--play-info" in argv:
@@ -2898,7 +5331,9 @@ def main():
                 setup_scope(dwf, hdwf)
                 capture(dwf, hdwf, 25e6, 1 << 16)      # discard: settling
                 scale = calibrate_play_rate(dwf, hdwf, ch, fn)
-            div, spl, rate, line_hz = choose_stream_timing(100e6)
+            div, spl, rate, line_hz = choose_stream_timing(
+                100e6, colour="--color" in argv,
+                force_div=opt("--stream-div", int, None))
             print(f"Deep-memory playback: {frame_lines()}-line "
                   f"{'interlaced' if INTERLACED else 'progressive'}, "
                   f"func {fn.value}, rate scale {scale:.4f}x")
@@ -2906,6 +5341,36 @@ def main():
             report_timing(spl, rate)
             print(f"      100 MHz/{div} exactly, line {line_hz:.2f} Hz "
                   f"({(line_hz / LINE_FREQ_HZ - 1) * 100:+.4f}%)")
+            if "--dual-probe" in argv:
+                dual_apply_probe(
+                    dwf, hdwf, ch, rate, scale,
+                    STREAM_SQUARE or 100,
+                    opt("--dual-buffer", int, 2_000_000),
+                    opt("--dual-hz", float, 100.0),
+                    sacrificial="--dual-sacrificial" in argv,
+                    path=SAVE_CAPTURE,
+                    change_to=opt("--dual-change", int, 0))
+                return
+
+            if "--motion" in argv and "--dual" in argv:
+                start_motion_dual(dwf, hdwf, ch, spl, rate, scale)
+                return
+
+            if "--motion" in argv:
+                if STREAM_SQUARE and "--motion-stream" not in argv:
+                    square_deep_control(dwf, hdwf, ch, rate, scale,
+                                        STREAM_SQUARE, path=SAVE_CAPTURE)
+                    return
+                if "--motion-stream" in argv:
+                    start_motion_stream(dwf, hdwf, ch, spl, rate, scale)
+                else:
+                    start_motion(dwf, hdwf, ch, spl, rate, scale)
+                    try:
+                        while True:
+                            time.sleep(0.5)
+                    except KeyboardInterrupt:
+                        print("\nStopped.")
+                return
             total = start_deep(dwf, hdwf, ch, spl, rate, scale, fn,
                                colour="--color" in argv)
             if "--verify" in argv or "--analyze" in argv:

@@ -19,6 +19,9 @@ Verified against a **Leader LV5700A** waveform monitor / vectorscope and a CRT.
 # 75% EIA colour bars, 525-line interlaced — the good path
 python3 ntsc.py --deep --color --play-scale 1.0 --locked
 
+# a bouncing ball over the bars, looped from deep memory
+python3 ntsc.py --deep --color --play-scale 1.0 --locked --motion
+
 # monochrome bars, no setup needed
 python3 ntsc.py
 
@@ -61,6 +64,10 @@ default, and it is why `--series-75` is off unless asked for.
 reach 100, so they are the wrong thing to calibrate against. Use a flat field:
 
 ```bash
+# unbounded motion: a bouncing ball, buffer-swapped from deep memory
+python3 ntsc.py --deep --color --play-scale 1.0 --locked --motion --dual \
+                --series-75 --level 0.67
+
 # flat 100 IRE white field -- set --level so the monitor reads 100 IRE
 python3 ntsc.py --deep --color --play-scale 1.0 --locked --pattern white
 
@@ -98,6 +105,7 @@ values, and complements are exactly 180° apart. Luma is band-limited to
 | path | rate | samples/line | colour | host involvement |
 |---|---|---|---|---|
 | `--deep` | 14.286 MS/s | 908 | yes | **none after setup** |
+| `--deep --motion` | 14.286 MS/s | 908 | yes | **none at all** |
 | `--stream` | ~5.8 MS/s measured | ~370 | can't sustain it | continuous feed loop |
 | default (`funcCustom`) | 0.847 MS/s | 54 | no | none |
 
@@ -106,6 +114,62 @@ values, and complements are exactly 180° apart. Luma is band-limited to
 `--stream` feeds chunks via `PlayData` and is superseded for anything that
 fits in play memory. `funcCustom` loops a 32 Ki buffer in hardware, which is
 rock solid but caps samples-per-line.
+
+## Motion
+
+```bash
+# 4 s loop, ~1 screen-width/sec — the default
+python3 ntsc.py --deep --color --play-scale 1.0 --locked --motion
+
+# 9.4 s loop: slower, more natural motion, 1 GB of host RAM
+python3 ntsc.py --deep --color --play-scale 1.0 --locked --motion \
+                --motion-seconds 9.4
+```
+
+A white, luma-only ball bounces over the static bars. The whole animation goes
+into play memory in **one `DataSet`** and loops with run 0 / repeat 0 — the
+same mechanism `--deep` uses for a static picture — so the hardware loop *is*
+the animation and there is no host feed at all.
+
+**`--dual` removes the 9.34 s ceiling.** One buffer of `--dual-seq` whole
+four-field sequences (default 4 = 267 ms) loops in hardware while the next
+pass is generated and handed over with `NodeDataSet` +
+`FDwfAnalogOutConfigure(ch, 3)`. Still no `PlayData`, so still none of the
+sample loss streaming suffers. Measured: **0 defects over 14,284 square-wave
+half-periods** with applies happening, generation 2 ms and upload 45 ms against
+a 267 ms budget, 356 applies with none refused, 1.36 G samples of unique
+content. Confirmed on a CRT — no rolling, no stutter.
+
+Two constraints the code enforces or relies on: `NodeDataSet` **silently does
+nothing below about 2,000,000 samples** (it returns success and the channel
+keeps playing stale content, so `--dual` refuses and names the minimum
+`--dual-seq`), and the apply takes effect **immediately** rather than at a
+buffer wrap — harmless here because every pass carries identical sync
+structure, so only the ball position can move.
+
+Note the ball's path repeats about every 5 s: a constant-velocity bouncing
+ball is periodic (x period 4.76 s, y 6.45 s at the default speeds) even though
+the data is new every pass.
+
+Only the ball moves, so the static four-field background is built once and
+`memmove`'d per sequence with the ball painted over it as contiguous runs:
+6,271 samples of edit per 953,400, and 0.08 s to build all 60 sequences.
+
+| `--motion-seconds` | sequences | loop | host RAM | ball speed |
+|---|---|---|---|---|
+| 1.0 | 15 | 1.00 s | 114 MB | 4.00 w/s |
+| **4.0** (default) | 60 | 4.00 s | 458 MB | 1.00 w/s |
+| 9.4 | 140 | 9.34 s | 1068 MB | 0.43 w/s |
+
+**Loop length buys slower motion.** A seamless loop needs the content to close,
+not just the buffer: each four-field sequence already closes on 238,875 whole
+subcarrier cycles, but the ball must also complete a whole number of bounce
+cycles, and the x and y counts have to be coprime and distinct — equal counts
+put the axes in lockstep and the ball slides along one diagonal instead of
+bouncing. Rounding to whole cycles is what ties speed to loop length.
+
+`--motion-stream` selects an alternative path that appends with `PlayData`
+instead. **It has never produced output** — see Status.
 
 ## Measurement
 
@@ -179,6 +243,8 @@ assume.
 | `ntsc.py` | the generator and analyser |
 | `NTSC_FINDINGS.md` | measured device and NTSC facts, with the numbers |
 | `NTSC_SCORECARD.md` | an honest account of which theories held up |
+| `NTSC_STREAMING_STRATEGIES.md` | options considered for unbounded output, with the result |
+| `TODO.md` | outstanding work, including a cleanup pass |
 
 Scope captures are gitignored — they run to 10 M samples (~200 MB) each.
 
@@ -197,3 +263,32 @@ anomaly remains: a single line per sequence at ~73% peak white, roughly 90%
 through the sequence. Sync width, line period and burst amplitude all scan
 clean. The subcarrier sits 250 Hz below nominal as a consequence of locking it
 to 227.5 × our line rate; `--fsc-nominal` trades that for SCH phase walking.
+
+`--motion` works: a bouncing ball loops out of deep memory with no host
+involvement.
+
+**Unbounded motion works** via `--motion --dual`: a deep-memory buffer swapped
+with `FDwfAnalogOutConfigure(ch, 3)`, measured at **0 defects** over 14,284
+square-wave half-periods with applies in flight, and confirmed on a CRT.
+
+**Closed: streamed video is not achievable on this unit.** `PlayData`
+streaming works — `--motion-stream` sustains the colour rate indefinitely with
+a clean feed — but the device loses and gains whole **32-sample blocks** at
+about 900 per second, which is 15 timing displacements of 2.24 µs per field
+and far more than a monitor's vertical lock will absorb.
+
+Established against a hardware control (`funcSquare`, no streaming in the
+path), which measured clean to ±0.003 samples over 5,714 half-periods:
+
+| source | defects |
+|---|---|
+| `funcSquare`, hardware | **none**, median 100.000 (99.997..100.003) |
+| `funcPlayPattern`, streamed | **36 of 5,718**, range 0.912..132.001 |
+
+The event rate is fixed rather than throughput-dependent — dropping to
+11.111 MS/s left it at ~825/s and made the net loss worse (0.087% → 0.254%)
+— and `lost`/`corrupt` report zero throughout, so those counters cannot
+validate a stream. Full numbers in **[NTSC_FINDINGS.md](NTSC_FINDINGS.md)**.
+
+Use `--motion` (deep-memory loop) for a clean picture. The streaming path is
+kept for signals tolerant of 0.1% sample loss.
