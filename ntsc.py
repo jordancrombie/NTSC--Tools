@@ -3026,10 +3026,10 @@ def square_deep_control(dwf, hdwf, ch, rate, scale, half_n,
 
     check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
     dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
-    check(dwf, dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
-                                              ctypes.c_int(1)), "NodeEnableSet")
-    check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier,
-                                                funcSquare), "NodeFunctionSet")
+    check(dwf, dwf.FDwfAnalogOutNodeEnableSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_int(1)), "NodeEnableSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(
+        hdwf, ch, AnalogOutNodeCarrier, funcSquare), "NodeFunctionSet")
     check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
         hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(hz)), "FrequencySet")
     check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
