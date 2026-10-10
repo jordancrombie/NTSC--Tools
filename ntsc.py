@@ -4008,9 +4008,15 @@ def transport_info(dwf):
     specific to Ethernet. enumfilterUSB and enumfilterNetwork settle it.
     """
     print("\nTransport:")
+    # enumfilterUSB (1) and enumfilterNetwork (2) collide with the legacy
+    # device-type values enumfilterEExplorer (1) and enumfilterDiscovery (2),
+    # so the SDK reads them as type filters and an ADP2230 matches neither --
+    # both came back 0 while enumfilterAll found the device. The transport
+    # cannot be determined this way; the per-call timings below settle what
+    # actually matters anyway.
     found = {}
-    for name, filt in (("USB", enumfilterUSB),
-                       ("Network", enumfilterNetwork),
+    for name, filt in (("USB?", enumfilterUSB),
+                       ("Network?", enumfilterNetwork),
                        ("all", enumfilterAll)):
         n = ctypes.c_int()
         if dwf.FDwfEnum(filt, ctypes.byref(n)) != 1:
@@ -4028,17 +4034,8 @@ def transport_info(dwf):
               + ("".join(f"\n             {x}" for x in names) if names
                  else ""))
 
-    if found.get("USB", 0) and not found.get("Network", 0):
-        print("\n  -> USB only. A 1792 us status round trip is NOT explained "
-              "by the\n     transport, and is worth reporting to Digilent.")
-    elif found.get("Network", 0) and not found.get("USB", 0):
-        print("\n  -> NETWORK only. That explains a 1792 us round trip, and "
-              "Digilent's\n     forums report streaming discontinuities "
-              "specific to Ethernet.\n     Connect the ADP2230 by USB and "
-              "re-run the integrity test.")
-    elif found.get("USB", 0) and found.get("Network", 0):
-        print("\n  -> BOTH available. FDwfDeviceOpen picks one; open with the "
-              "USB\n     filter to be sure which is in use.")
+    print("  (the USB/Network filter values are ambiguous in this SDK; "
+          "ignore those two rows)")
 
     # Time a round trip on whatever the default open gives us.
     hdwf = ctypes.c_int()
@@ -4067,7 +4064,72 @@ def transport_info(dwf):
             us = (time.time() - t) / 200 * 1e6
             print(f"  {label:30} {us:8.1f} us  "
                   f"({1e6 / us:7.0f} calls/s)")
-        print("  Tens of microseconds is normal for USB; ~1800 us is not.")
+        print("  PlayStatus and ParamGet at ~1 us are LOCAL reads of state "
+              "that\n  AnalogOutStatus fetched and cached -- which is why "
+              "PlayStatus goes\n  stale without it, exactly as the manual's "
+              "call order implies.")
+
+        # The one call never timed. If a bulk write costs milliseconds, that
+        # is the real throughput ceiling, not AnalogOutStatus.
+        rate = 100e6 / 7
+        dwf.FDwfAnalogOutReset(hdwf, ch)
+        dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+        dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
+                                       ctypes.c_int(1))
+        dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier,
+                                         funcPlayPattern)
+        dwf.FDwfAnalogOutNodeFrequencySet(hdwf, ch, AnalogOutNodeCarrier,
+                                          ctypes.c_double(rate))
+        dwf.FDwfAnalogOutNodeAmplitudeSet(hdwf, ch, AnalogOutNodeCarrier,
+                                          ctypes.c_double(1.0))
+        cb = ctypes.c_int()
+        dwf.FDwfAnalogOutNodeDataInfo(hdwf, ch, AnalogOutNodeCarrier, 0,
+                                      ctypes.byref(cb))
+        pre = (ctypes.c_double * max(1, cb.value))()
+        dwf.FDwfAnalogOutNodeDataSet(hdwf, ch, AnalogOutNodeCarrier, pre,
+                                     ctypes.c_int(len(pre)))
+        if dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)) != 1:
+            print(f"\n  could not start play mode: {last_error(dwf)}")
+            return found
+        src = (ctypes.c_double * (1 << 16))()
+        print(f"\n  FDwfAnalogOutNodePlayData cost by size "
+              f"(FIFO is {len(pre):,}):")
+        print(f"    {'samples':>8} {'us/call':>9} {'MS/s if that were the '
+              'only cost':>38}")
+        for n in (1024, 4096, 8192, 16384, 32768):
+            if n > len(src):
+                continue
+            # Keep the FIFO fed so the call is not blocking on a full buffer.
+            dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts))
+            dwf.FDwfAnalogOutNodePlayStatus(
+                hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                ctypes.byref(lost), ctypes.byref(corr))
+            if free.value < n:
+                print(f"    {n:>8,} {'':>9}  only {free.value:,} free, "
+                      f"skipped")
+                continue
+            t = time.time()
+            reps = 0
+            while reps < 20:
+                if dwf.FDwfAnalogOutNodePlayData(
+                        hdwf, ch, AnalogOutNodeCarrier, src,
+                        ctypes.c_int(n)) != 1:
+                    break
+                reps += 1
+                dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts))
+                dwf.FDwfAnalogOutNodePlayStatus(
+                    hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                    ctypes.byref(lost), ctypes.byref(corr))
+                if free.value < n:
+                    break
+            if not reps:
+                print(f"    {n:>8,} refused")
+                continue
+            us = (time.time() - t) / reps * 1e6
+            # subtract the status pair we had to interleave
+            us_pd = max(0.0, us - 1625.0)
+            print(f"    {n:>8,} {us_pd:>9.1f} {n / max(us_pd, 1e-9):>38.2f}")
+        dwf.FDwfAnalogOutReset(hdwf, ch)
     finally:
         dwf.FDwfDeviceClose(hdwf)
     return found
