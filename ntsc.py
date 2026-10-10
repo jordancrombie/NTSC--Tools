@@ -53,6 +53,7 @@ Run with --help for the full flag list.
 """
 
 import ctypes
+import gc
 import math
 import sys
 import time
@@ -3248,6 +3249,11 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
     (fed - (fifo - free)) / elapsed is the device's real consumption rate. It
     WILL underrun while running, so it is a diagnostic, not a mode to play in.
     """
+    # A garbage collection pass longer than the FIFO's 2.29 ms starves the
+    # device, and the counters do not report it. The loop allocates nothing
+    # per iteration, so there is nothing for the collector to find anyway.
+    gc_was_on = gc.isenabled()
+    gc.disable()
     staging = (ctypes.c_double * fifo)()
     abs_pos = fifo              # the prime already delivered the first `fifo`
     fed = fifo
@@ -3456,6 +3462,8 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
         print(f"\nStopped after {el:.1f} s: {fed / 1e6:.1f} M samples at "
               f"{fed / el / 1e6:.3f} MS/s, minimum fill {wf:.2f} ms, "
               f"lost {t_lost:,}, corrupt {t_corr:,}")
+        if gc_was_on:
+            gc.enable()
         if actual and spl_hint:
             line_hz = actual / spl_hint
             print(f"  device consumed {actual / 1e6:.4f} MS/s vs "
@@ -3949,7 +3957,11 @@ def feed_tune(dwf, secs=1.2):
             v = sorted(s)[len(s) // 2]
             return fed / el / 1e6, t_lost, t_corr, v, depth, err
 
-        targets = (1e6, 2e6, 5e6, 8e6, 11e6, 100e6 / 7)
+        # Sweep PAST the colour rate. The earlier sweep stopped at 14.286 and
+        # reported "achievable", which told us nothing about the margin -- and
+        # the margin is what decides whether occasional host hiccups turn into
+        # dropouts.
+        targets = (1e6, 5e6, 11e6, 100e6 / 7, 16e6, 20e6, 25e6, 30e6)
         print(f"\n  {'loop':6} {'target':>9} {'achieved':>9} {'lost':>8} "
               f"{'corrupt':>8} {'CH1':>7} {'depth':>8}  verdict")
         best = {}
