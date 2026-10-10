@@ -2801,6 +2801,17 @@ STREAM_STATIC = False
 # noticed per-chunk padding or alignment because it streamed DC. 908 is one
 # line; AnalogIn reports a buffer granularity of 16.
 STREAM_ALIGN = 1
+# Pacing against an assumed rate is OPEN LOOP and cannot hold: the device runs
+# 0.05% slow, so the fill estimate falls ~0.54 ms behind every second, and
+# after ~4 s we write into a FIFO we believe is empty and is actually full.
+# The device then drops samples silently -- level corruption, with lost and
+# corrupt reporting nothing. Two things close the loop:
+#   GUARD     headroom kept free, >= the worst drift between resyncs, so an
+#             optimistic estimate still cannot overfill.
+#   RESYNC_S  how often to pay 1792 us for a TRUE `free`, then refill by
+#             exactly that much and reset the estimate.
+STREAM_GUARD = 16384
+STREAM_RESYNC_S = 1.0
 DWF_STATE_NAMES = {DwfStateArmed: "armed", DwfStateDone: "done",
                    DwfStateRunning: "running", DwfStateWait: "wait"}
 
@@ -3204,6 +3215,9 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
     free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
     sts = ctypes.c_ubyte()
     t_poll = 0.0
+    t_resync = STREAM_RESYNC_S
+    resyncs = 0
+    drift_sum = 0.0
     t_rep = report
     t0 = time.time()
     worst_fill = float("inf")
@@ -3226,7 +3240,39 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
             fill = fed - now * rate
             if now > 0.25 and cap_state != "armed":
                 worst_fill = min(worst_fill, fill)
-            n = 0 if cap_state == "armed" else stream_chunk(fifo, fill, fifo, STREAM_ALIGN)
+
+            # Closed-loop resync. Read the TRUE free space, refill by exactly
+            # that much -- the only write size we can be certain of -- and
+            # reset the estimate to "full". Costs 1792 us, during which a full
+            # FIFO drains to about 0.5 ms, so it must not run often.
+            if cap_state != "armed" and now >= t_resync:
+                check(dwf, dwf.FDwfAnalogOutStatus(hdwf, ch,
+                                                   ctypes.byref(sts)),
+                      "AnalogOutStatus")
+                check(dwf, dwf.FDwfAnalogOutNodePlayStatus(
+                    hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                    ctypes.byref(lost), ctypes.byref(corrupt)), "PlayStatus")
+                t_lost += lost.value
+                t_corr += corrupt.value
+                room = min(max(0, free.value), fifo)
+                if STREAM_ALIGN > 1:
+                    room -= room % STREAM_ALIGN
+                if room > 0:
+                    fill_fn(staging, abs_pos, room)
+                    check(dwf, dwf.FDwfAnalogOutNodePlayData(
+                        hdwf, ch, AnalogOutNodeCarrier, staging,
+                        ctypes.c_int(room)), "PlayData(resync)")
+                    abs_pos += room
+                    fed += room
+                now = time.time() - t0
+                drift_sum += (fed - now * rate) - fifo
+                fed = now * rate + fifo          # estimate := FIFO full
+                resyncs += 1
+                t_resync = now + STREAM_RESYNC_S
+
+            target = max(1, fifo - STREAM_GUARD)
+            n = (0 if cap_state == "armed"
+                 else stream_chunk(target, fill, fifo, STREAM_ALIGN))
             if n > 0:
                 fill_fn(staging, abs_pos, n)
                 if dwf.FDwfAnalogOutNodePlayData(
@@ -3354,12 +3400,14 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
             if now >= t_rep:
                 wf = (0.0 if worst_fill == float("inf")
                       else worst_fill / rate * 1000)
+                dr = (drift_sum / resyncs / rate * 1000) if resyncs else 0.0
                 extra = (f"  device {actual / 1e6:6.3f} MS/s "
                          f"({(actual / rate - 1) * 100:+.3f}%)"
                          if actual else "")
                 print(f"  {now:6.1f} s  fed {fed / now / 1e6:6.3f} MS/s "
                       f"(need {rate / 1e6:.3f}){extra}  fill "
                       f"{fill / rate * 1000:+5.2f} ms  min {wf:+5.2f} ms  "
+                      f"resync {resyncs} (drift {dr:+.2f} ms)  "
                       f"lost {t_lost:,}  corrupt {t_corr:,}")
                 t_rep = now + report
     except KeyboardInterrupt:
@@ -4038,7 +4086,7 @@ def main():
             "--sys-clock", "--capture", "--seconds", "--level",
             "--burst-start", "--burst-amp", "--copies", "--setup",
             "--bar-amp", "--motion-seconds", "--stream-capture",
-            "--stream-func", "--stream-align"}
+            "--stream-func", "--stream-align", "--stream-resync"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -4072,6 +4120,7 @@ def main():
     global RUN_INFINITE, COPIES
     global SOURCE_SERIES_75R, MOTION_SECONDS, STREAM_RATE_CHECK
     global STREAM_CAPTURE_AT, STREAM_FUNC, STREAM_STATIC, STREAM_ALIGN
+    global STREAM_RESYNC_S
     # --locked: the combination measured to lock a Leader LV5700A through a
     # vectorscope-and-monitor chain. Individual flags still override it.
     if "--locked" in argv:
@@ -4092,6 +4141,7 @@ def main():
     STREAM_CAPTURE_AT = opt("--stream-capture", float, None)
     STREAM_STATIC = "--stream-static" in argv
     STREAM_ALIGN = max(1, opt("--stream-align", int, 1))
+    STREAM_RESYNC_S = max(0.05, opt("--stream-resync", float, STREAM_RESYNC_S))
     STREAM_FUNC = opt("--stream-func", str, STREAM_FUNC)
     if STREAM_FUNC not in ("play", "pattern"):
         raise RuntimeError("--stream-func must be 'play' or 'pattern'.")
