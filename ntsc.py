@@ -3518,9 +3518,23 @@ def make_square_filler(half_n, lo=-0.9, hi=0.9):
     position and a size. It answers the one question nothing else has: does
     PlayData deliver exactly the samples we hand it?
     """
+    # One period, tiled with memmove. The first version wrote every sample
+    # from Python and cost 2.761 ms per chunk against a 2.29 ms FIFO -- it
+    # starved the feed it was built to measure, and reported the resulting
+    # underruns as device defects.
+    period = 2 * half_n
+    tile = (ctypes.c_double * period)()
+    for i in range(period):
+        tile[i] = hi if (i // half_n) % 2 == 0 else lo
+
     def fill(dst, abs_pos, n):
-        for i in range(n):
-            dst[i] = hi if ((abs_pos + i) // half_n) % 2 == 0 else lo
+        done = 0
+        while done < n:
+            off = (abs_pos + done) % period
+            m = min(n - done, period - off)
+            ctypes.memmove(ctypes.byref(dst, done * 8),
+                           ctypes.byref(tile, off * 8), m * 8)
+            done += m
     return fill
 
 
@@ -3741,9 +3755,16 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
     for _ in range(20):
         fill_fn(probe, 12345, fifo)
     gen = (time.time() - t) / 20
-    print(f"      FIFO {fifo:,} samples ({fifo / rate * 1000:.2f} ms budget); "
+    budget = fifo / rate
+    print(f"      FIFO {fifo:,} samples ({budget * 1000:.2f} ms budget); "
           f"generating a chunk costs {gen * 1000:.3f} ms "
-          f"({gen / (fifo / rate) * 100:.1f}% of it)")
+          f"({gen / budget * 100:.1f}% of it)")
+    if gen > 0.30 * budget:
+        raise RuntimeError(
+            f"Chunk generation needs {gen * 1000:.3f} ms of a "
+            f"{budget * 1000:.2f} ms FIFO ({gen / budget * 100:.0f}%). The "
+            f"feed cannot keep up and every measurement taken this way would "
+            f"describe the starvation, not the device.")
     if STREAM_RATE_CHECK:
         print("      --stream-rate-check: paying 1792 us per poll for a "
               "trustworthy `free`.\n"
