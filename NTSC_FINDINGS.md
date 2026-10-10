@@ -200,10 +200,30 @@ clean on a measurably broken one.
 vertical lock unsettled, which matches a picture that rolls, twists, and
 tracks feed health rather than content.
 
-**Suspected cause, not yet confirmed:** our `PlayData` counts are arbitrary
-(`fifo - fill`), and if the play buffer works in 32-sample blocks then a
-partial block at the end of a write would be dropped or duplicated.
-`--stream-align 32` forces every count to a multiple of 32 and tests it.
+**CONFIRMED against a hardware control.** The same square wave, the same
+scope settings, the same analysis, differing only in how the samples reach the
+DAC:
+
+| source | edges (5,714 expected) | defects | median half-period |
+|---|---|---|---|
+| `funcSquare`, generated in hardware | 5,715 | **none** | 100.000 (99.997..100.003) |
+| `funcPlayPattern`, streamed | 5,719 | **36 of 5,718** | 100.000, range 0.912..132.001 |
+
+The control is clean to **+/-0.003 samples**, so the DAC and the capture path
+are sound and the streamed defects are real. Streaming on this device loses
+and gains whole 32-sample blocks at about 900 per second -- 0.115% of the
+stream -- and `lost`/`corrupt` report zero throughout.
+
+**Not caused by our write sizes.** `--stream-align 32` changed nothing: 38 of
+5,720 against 36 of 5,720 unaligned, net -696 against -655. The device drops
+blocks regardless of how the writes are shaped.
+
+**Consequence for video.** Fifteen 2.24 us displacements per field is far more
+than a monitor's AFC or vertical lock will absorb, which is why the streamed
+picture rolls and twists while the identical content played from deep memory
+is perfect. There is no host-side fix: the feed is already clean by every
+measure available (right rate, positive fill, zero counters, generation at 5%
+of budget).
 
 **Two diagnostics in this project broke what they measured.** `AnalogOutStatus`
 at 10 Hz cost 1792 us of a 2.29 ms FIFO, and the first `--stream-square`

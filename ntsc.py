@@ -3059,7 +3059,10 @@ def square_deep_control(dwf, hdwf, ch, rate, scale, half_n,
         print(f"  wrote {path}")
     # Measure against the half-period the DEVICE actually produces, so a
     # frequency it rounded does not read as sample loss.
-    square_integrity(samples, 1e6 / scope_rate, rate, rate / (2.0 * hz))
+    half = rate / (2.0 * hz)
+    if abs(half - round(half)) < 1e-6:
+        half = round(half)
+    square_integrity(samples, 1e6 / scope_rate, rate, half)
     print("\n  CLEAN here means the DAC and the capture path are sound, so")
     print("  the defects --motion-stream reports are real. DIRTY here means")
     print("  the instrument or the capture is at fault and the streaming")
