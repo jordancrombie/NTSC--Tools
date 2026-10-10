@@ -187,3 +187,70 @@ diagnosed.
 - <https://forum.digilent.com/topic/33982-ad3-first-fdwfanalogoutconfigurech-3-glitch-observed-after-channel-start>
 - <https://forum.digilent.com/topic/22260-applying-analogoutconfigure-dynamically-fstart3-for-master-slave-configured-channels-in-analog-discovery-studio/>
 - <https://forum.digilent.com/topic/32912-play-with-discovery-3-being-sure-no-data-is-lost/>
+
+
+---
+
+# Implementation plan — strategy A (validated, now being built)
+
+`Configure(ch, 3)` was measured to swap a running `funcPlay` buffer with zero
+defects (14,285 half-periods clean with 4 applies, against 0.63% for streamed
+`PlayData`). Full numbers in **NTSC_FINDINGS.md**. This is the plan that
+follows from it.
+
+## Shape
+
+One deep-memory buffer of `M` whole four-field sequences, looping in hardware.
+While pass *k* plays, generate pass *k+1* into the host buffer, then
+`NodeDataSet` + `Configure(ch, 3)`. No `PlayData`, no FIFO, so none of the
+32-sample wrap loss.
+
+```
+    N = M * 953,400 samples          (M = 4 -> 3,813,600 = 267 ms, 30.5 MB)
+    fill pass 0 -> DataSet -> RunSet(0.0) -> RepeatSet(0) -> Configure(1)
+    loop:
+        fill pass k+1 at absolute sample position (k+1)*N
+        DataSet + Configure(ch, 3)
+        pace to one apply per buffer period
+```
+
+Content comes from the existing `fill_fn(dst, abs_pos, n)` interface, so the
+ball position is a function of absolute sample index and nothing repeats.
+
+## Constraints being respected
+
+- **`DataSet` below ~2,000,000 samples silently does nothing** and the channel
+  keeps playing stale deep-memory content, returning success. `M = 4` gives
+  3.8 M, comfortably clear; the code refuses smaller.
+- **`RunSet(0.0)` with `RepeatSet(0)`** is the configuration `--motion` already
+  uses for a byte-perfect picture, and avoids the ~24-sample re-arm gap that a
+  bounded repeated run costs at every boundary. The `--dual-probe` validation
+  used a bounded run, so **applies must be re-verified with run 0** before
+  trusting this.
+- **The swap is immediate**, not deferred to a wrap. Accepted deliberately:
+  sync structure is identical in every pass, so a mid-buffer swap cannot
+  disturb sync timing. The only consequence is the ball jumping by up to one
+  buffer period of travel — about 11% of screen width at M = 4.
+- **No sacrificial applies.** The AD3 workaround measured *worse* here.
+
+## Budget
+
+| | |
+|---|---|
+| buffer | 3,813,600 samples, 267 ms playout, 30.5 MB |
+| upload | ~47 ms at the measured 654 MB/s |
+| generation | ~1.3 ms of painting plus ~10 ms of memmove |
+| headroom | ~58 ms of work per 267 ms pass, about 22% |
+
+## Order of work
+
+1. `start_motion_dual()` behind `--motion --dual`, with `--dual-seq` for `M`.
+2. Validate with `--stream-square` first, not by eye: applies must stay clean
+   with `RunSet(0.0)`, which the probe has not yet tested.
+3. Only then judge the picture, and measure the ball jump at the seam.
+4. If the jump is visible, add phase-timed applies so the upload completes just
+   after a wrap. That is a refinement on top, not a rewrite.
+
+Deliberately **not** doing: phase-timed applies in the first version, and any
+`PlayData` fallback. One variable at a time, and validate the instrument before
+the subject — both lessons this project paid for repeatedly.
