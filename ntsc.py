@@ -3149,7 +3149,7 @@ def stream_line_jitter(samples, dt_us, rate, spl):
 
 def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                 rate_check=False, spl_hint=None, capture_at=None,
-                capture_path=None, capture_s=0.020, scope_rate=50e6):
+                capture_path=None, capture_s=0.0020, scope_rate=50e6):
     """Stream an arbitrary signal, generated on demand, paced against a clock.
 
     `fill_fn(dst, abs_pos, n)` writes n samples of the signal starting at
@@ -3202,9 +3202,9 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
         while True:
             now = time.time() - t0
             fill = fed - now * rate
-            if now > 0.25:
+            if now > 0.25 and cap_state != "armed":
                 worst_fill = min(worst_fill, fill)
-            n = stream_chunk(fifo, fill, fifo)
+            n = 0 if cap_state == "armed" else stream_chunk(fifo, fill, fifo)
             if n > 0:
                 fill_fn(staging, abs_pos, n)
                 if dwf.FDwfAnalogOutNodePlayData(
@@ -3248,6 +3248,17 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                         hdwf, ctypes.c_double(scope_rate)), "InFrequencySet")
                     check(dwf, dwf.FDwfAnalogInBufferSizeSet(
                         hdwf, ctypes.c_int(cap_n)), "InBufferSizeSet")
+                    # Fill the FIFO completely first: once armed we stop
+                    # feeding, so whatever is in there is all the signal the
+                    # capture will see.
+                    n0 = stream_chunk(fifo, fed - now * rate, fifo)
+                    if n0 > 0:
+                        fill_fn(staging, abs_pos, n0)
+                        check(dwf, dwf.FDwfAnalogOutNodePlayData(
+                            hdwf, ch, AnalogOutNodeCarrier, staging,
+                            ctypes.c_int(n0)), "PlayData(pre-capture)")
+                        fed += n0
+                        abs_pos += n0
                     check(dwf, dwf.FDwfAnalogInConfigure(
                         hdwf, ctypes.c_int(1), ctypes.c_int(1)),
                         "InConfigure")
@@ -3267,8 +3278,14 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                     cap_state = "armed"
                     cap_armed_at = now
                     t_cap = now + 0.05
-                elif cap_state == "armed" and now >= t_cap:
-                    t_cap = now + 0.05
+                elif cap_state == "armed":
+                    # Do NOT feed while acquiring. --feed-matrix read CH1
+                    # correctly in this configuration with the feed loop
+                    # stopped, and reads flat with it running, so concurrent
+                    # PlayData is the prime suspect. The FIFO holds ~2.29 ms,
+                    # which is why capture_s defaults small: the window has to
+                    # fit inside what is already buffered.
+                    t_cap = now + 0.002
                     check(dwf, dwf.FDwfAnalogInStatus(
                         hdwf, ctypes.c_int(0), ctypes.byref(in_sts)),
                         "InStatus(poll)")
@@ -3305,6 +3322,12 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                         else:
                             show_profile(prof, "streamed output")
                         stream_line_jitter(samples, dt_us, rate, spl_hint)
+                        # The pause emptied the FIFO, so the clock-paced
+                        # estimate is now badly stale. Re-baseline it to a
+                        # fill of zero rather than letting it chase a deficit
+                        # of hundreds of milliseconds.
+                        t0 = time.time() - fed / rate
+                        print("  resuming; pacing clock re-baselined")
 
             if now >= t_rep:
                 wf = (0.0 if worst_fill == float("inf")
