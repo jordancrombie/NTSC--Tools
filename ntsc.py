@@ -2819,6 +2819,9 @@ STREAM_ALIGN = 1
 # lost 0, corrupt 0, for 26 s. Kept as knobs, not as defaults.
 STREAM_GUARD = 0
 STREAM_RESYNC_S = 0.0              # 0 disables the resync entirely
+# --stream-capture-s: acquisition window. Must exceed one field (16.7 ms) to
+# contain a vertical interval, which is what a rolling picture is about.
+STREAM_CAPTURE_S = 0.040
 DWF_STATE_NAMES = {DwfStateArmed: "armed", DwfStateDone: "done",
                    DwfStateRunning: "running", DwfStateWait: "wait"}
 
@@ -3189,7 +3192,7 @@ def stream_line_jitter(samples, dt_us, rate, spl):
 
 def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                 rate_check=False, spl_hint=None, capture_at=None,
-                capture_path=None, capture_s=0.0020, scope_rate=50e6):
+                capture_path=None, capture_s=0.040, scope_rate=50e6):
     """Stream an arbitrary signal, generated on demand, paced against a clock.
 
     `fill_fn(dst, abs_pos, n)` writes n samples of the signal starting at
@@ -3245,7 +3248,7 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
         while True:
             now = time.time() - t0
             fill = fed - now * rate
-            if now > 0.25 and cap_state != "armed":
+            if now > 0.25:
                 worst_fill = min(worst_fill, fill)
 
             # Closed-loop resync. Read the TRUE free space, refill by exactly
@@ -3279,8 +3282,7 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                 t_resync = now + STREAM_RESYNC_S
 
             target = max(1, fifo - STREAM_GUARD)
-            n = (0 if cap_state == "armed"
-                 else stream_chunk(target, fill, fifo, STREAM_ALIGN))
+            n = stream_chunk(target, fill, fifo, STREAM_ALIGN)
             if n > 0:
                 fill_fn(staging, abs_pos, n)
                 if dwf.FDwfAnalogOutNodePlayData(
@@ -3356,12 +3358,11 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                     cap_armed_at = now
                     t_cap = now + 0.05
                 elif cap_state == "armed":
-                    # Do NOT feed while acquiring. --feed-matrix read CH1
-                    # correctly in this configuration with the feed loop
-                    # stopped, and reads flat with it running, so concurrent
-                    # PlayData is the prime suspect. The FIFO holds ~2.29 ms,
-                    # which is why capture_s defaults small: the window has to
-                    # fit inside what is already buffered.
+                    # Keep feeding during acquisition. The pause here was
+                    # added on a concurrency theory that turned out to be a
+                    # disconnected CH1; with the jumper in place a running
+                    # feed captures fine, and the window has to span more
+                    # than one field (16.7 ms) to contain a vertical interval.
                     t_cap = now + 0.002
                     check(dwf, dwf.FDwfAnalogInStatus(
                         hdwf, ctypes.c_int(0), ctypes.byref(in_sts)),
@@ -3400,12 +3401,11 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                         else:
                             show_profile(prof, "streamed output")
                         stream_line_jitter(samples, dt_us, rate, spl_hint)
-                        # The pause emptied the FIFO, so the clock-paced
-                        # estimate is now badly stale. Re-baseline it to a
-                        # fill of zero rather than letting it chase a deficit
-                        # of hundreds of milliseconds.
-                        t0 = time.time() - fed / rate
-                        print("  resuming; pacing clock re-baselined")
+                        # Reading a large buffer stalls the loop, so the
+                        # clock-paced estimate is stale afterwards. Re-baseline
+                        # it to "FIFO full" rather than chasing the deficit.
+                        t0 = time.time() - (fed - fifo) / rate
+                        print("  pacing clock re-baselined after readback")
 
             if now >= t_rep:
                 wf = (0.0 if worst_fill == float("inf")
@@ -3591,7 +3591,8 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
     print("\nStreaming unbounded motion. Press Ctrl+C to stop.")
     stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo,
                 rate_check=STREAM_RATE_CHECK, spl_hint=spl,
-                capture_at=STREAM_CAPTURE_AT, capture_path=SAVE_CAPTURE)
+                capture_at=STREAM_CAPTURE_AT, capture_path=SAVE_CAPTURE,
+                capture_s=STREAM_CAPTURE_S)
     return total
 
 
@@ -4097,7 +4098,7 @@ def main():
             "--burst-start", "--burst-amp", "--copies", "--setup",
             "--bar-amp", "--motion-seconds", "--stream-capture",
             "--stream-func", "--stream-align", "--stream-resync",
-            "--stream-guard"}
+            "--stream-guard", "--stream-capture-s"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -4131,7 +4132,7 @@ def main():
     global RUN_INFINITE, COPIES
     global SOURCE_SERIES_75R, MOTION_SECONDS, STREAM_RATE_CHECK
     global STREAM_CAPTURE_AT, STREAM_FUNC, STREAM_STATIC, STREAM_ALIGN
-    global STREAM_RESYNC_S, STREAM_GUARD
+    global STREAM_RESYNC_S, STREAM_GUARD, STREAM_CAPTURE_S
     # --locked: the combination measured to lock a Leader LV5700A through a
     # vectorscope-and-monitor chain. Individual flags still override it.
     if "--locked" in argv:
@@ -4154,6 +4155,7 @@ def main():
     STREAM_ALIGN = max(1, opt("--stream-align", int, 1))
     STREAM_RESYNC_S = opt("--stream-resync", float, STREAM_RESYNC_S)
     STREAM_GUARD = max(0, opt("--stream-guard", int, STREAM_GUARD))
+    STREAM_CAPTURE_S = opt("--stream-capture-s", float, STREAM_CAPTURE_S)
     STREAM_FUNC = opt("--stream-func", str, STREAM_FUNC)
     if STREAM_FUNC not in ("play", "pattern"):
         raise RuntimeError("--stream-func must be 'play' or 'pattern'.")
