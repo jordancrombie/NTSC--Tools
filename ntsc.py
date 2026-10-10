@@ -3319,7 +3319,8 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                     # Fill the FIFO completely first: once armed we stop
                     # feeding, so whatever is in there is all the signal the
                     # capture will see.
-                    n0 = stream_chunk(fifo, fed - now * rate, fifo, STREAM_ALIGN)
+                    n0 = stream_chunk(fifo, fed - now * rate, fifo,
+                                      STREAM_ALIGN)
                     if n0 > 0:
                         fill_fn(staging, abs_pos, n0)
                         check(dwf, dwf.FDwfAnalogOutNodePlayData(
@@ -3359,9 +3360,10 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                         "InStatus(poll)")
                     if (in_sts.value != DwfStateDone
                             and now - cap_armed_at > 10.0):
+                        st = DWF_STATE_NAMES.get(in_sts.value,
+                                                 in_sts.value)
                         print(f"  capture timed out after 10 s in state "
-                              f"{DWF_STATE_NAMES.get(in_sts.value, in_sts.value)}"
-                              f" -- no trigger? nothing written.")
+                              f"{st} -- no trigger? nothing written.")
                         cap_state = "done"
                     elif in_sts.value == DwfStateDone:
                         print(f"  acquired at {now:.1f} s "
