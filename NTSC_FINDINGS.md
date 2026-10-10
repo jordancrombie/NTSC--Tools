@@ -175,6 +175,42 @@ unterminated stub — the usual cause of edge overshoot), not amplitude. Level i
 `--level`, and with the resistor fitted `--level` means the same thing at the
 load as it did without it.
 
+**MEASURED: streamed PlayData loses and gains whole 32-SAMPLE BLOCKS.**
+Found with `--stream-square`, which streams a square wave of known
+half-period in samples and measures each half-period back; DC cannot show a
+dropped sample and video is too tangled to attribute one. On a clean feed
+(chunk generation 5.7% of budget, 14.292 MS/s fed, fill positive throughout,
+`lost` and `corrupt` both 0):
+
+| | |
+|---|---|
+| defects | 36 of 5,720 half-periods (0.63%) |
+| size | always a whole 32-sample block: -32.00, +32.00, or split (-23.09 with -8.00) |
+| rate | ~900/s, about 15 per field |
+| each worth | 2.24 us of timing displacement at 14.286 MS/s |
+| net | -655 samples per 40 ms, 16,378/s lost, 0.115% of the stream |
+| spacing | irregular, median 158 half-periods, range 1..328 |
+
+The irregular spacing rules out the sequence wrap and any fixed chunk
+boundary. `lost` and `corrupt` report zero throughout, so **those counters
+cannot be used to validate a stream** -- this is the third time they have read
+clean on a measurably broken one.
+
+15 displacements of 2.24 us per field is ample to keep a monitor's AFC and
+vertical lock unsettled, which matches a picture that rolls, twists, and
+tracks feed health rather than content.
+
+**Suspected cause, not yet confirmed:** our `PlayData` counts are arbitrary
+(`fifo - fill`), and if the play buffer works in 32-sample blocks then a
+partial block at the end of a write would be dropped or duplicated.
+`--stream-align 32` forces every count to a multiple of 32 and tests it.
+
+**Two diagnostics in this project broke what they measured.** `AnalogOutStatus`
+at 10 Hz cost 1792 us of a 2.29 ms FIFO, and the first `--stream-square`
+filler wrote samples from Python at 2.761 ms per chunk against the same
+budget -- it reported its own starvation as 31 device defects. `stream_feed`
+now refuses to start when chunk generation exceeds 30% of the FIFO budget.
+
 **SETTLED: PlayData streams ONLY where play memory is 0.** Measured with
 `--feed-matrix`, which primes DC at -0.5 V and streams DC at +0.5 V so the
 capture says which one is on the wire. Both SDK recipes, all six
