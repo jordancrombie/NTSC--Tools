@@ -64,6 +64,10 @@ default, and it is why `--series-75` is off unless asked for.
 reach 100, so they are the wrong thing to calibrate against. Use a flat field:
 
 ```bash
+# unbounded motion: a bouncing ball, buffer-swapped from deep memory
+python3 ntsc.py --deep --color --play-scale 1.0 --locked --motion --dual \
+                --series-75 --level 0.67
+
 # flat 100 IRE white field -- set --level so the monitor reads 100 IRE
 python3 ntsc.py --deep --color --play-scale 1.0 --locked --pattern white
 
@@ -126,6 +130,26 @@ A white, luma-only ball bounces over the static bars. The whole animation goes
 into play memory in **one `DataSet`** and loops with run 0 / repeat 0 — the
 same mechanism `--deep` uses for a static picture — so the hardware loop *is*
 the animation and there is no host feed at all.
+
+**`--dual` removes the 9.34 s ceiling.** One buffer of `--dual-seq` whole
+four-field sequences (default 4 = 267 ms) loops in hardware while the next
+pass is generated and handed over with `NodeDataSet` +
+`FDwfAnalogOutConfigure(ch, 3)`. Still no `PlayData`, so still none of the
+sample loss streaming suffers. Measured: **0 defects over 14,284 square-wave
+half-periods** with applies happening, generation 2 ms and upload 45 ms against
+a 267 ms budget, 356 applies with none refused, 1.36 G samples of unique
+content. Confirmed on a CRT — no rolling, no stutter.
+
+Two constraints the code enforces or relies on: `NodeDataSet` **silently does
+nothing below about 2,000,000 samples** (it returns success and the channel
+keeps playing stale content, so `--dual` refuses and names the minimum
+`--dual-seq`), and the apply takes effect **immediately** rather than at a
+buffer wrap — harmless here because every pass carries identical sync
+structure, so only the ball position can move.
+
+Note the ball's path repeats about every 5 s: a constant-velocity bouncing
+ball is periodic (x period 4.76 s, y 6.45 s at the default speeds) even though
+the data is new every pass.
 
 Only the ball moves, so the static four-field background is built once and
 `memmove`'d per sequence with the ball painted over it as contiguous runs:
@@ -219,6 +243,8 @@ assume.
 | `ntsc.py` | the generator and analyser |
 | `NTSC_FINDINGS.md` | measured device and NTSC facts, with the numbers |
 | `NTSC_SCORECARD.md` | an honest account of which theories held up |
+| `NTSC_STREAMING_STRATEGIES.md` | options considered for unbounded output, with the result |
+| `TODO.md` | outstanding work, including a cleanup pass |
 
 Scope captures are gitignored — they run to 10 M samples (~200 MB) each.
 
@@ -240,6 +266,10 @@ to 227.5 × our line rate; `--fsc-nominal` trades that for SCH phase walking.
 
 `--motion` works: a bouncing ball loops out of deep memory with no host
 involvement.
+
+**Unbounded motion works** via `--motion --dual`: a deep-memory buffer swapped
+with `FDwfAnalogOutConfigure(ch, 3)`, measured at **0 defects** over 14,284
+square-wave half-periods with applies in flight, and confirmed on a CRT.
 
 **Closed: streamed video is not achievable on this unit.** `PlayData`
 streaming works — `--motion-stream` sustains the colour rate indefinitely with
