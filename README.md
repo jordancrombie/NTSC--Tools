@@ -241,10 +241,24 @@ to 227.5 × our line rate; `--fsc-nominal` trades that for SCH phase walking.
 `--motion` works: a bouncing ball loops out of deep memory with no host
 involvement.
 
-**Open: nothing streamed with `PlayData` has ever reached the output in
-config 3.** Across three runs the prime size was the only variable that
-predicted whether a picture appeared — a full `DataSet` displays, a
-32,768-sample `DataInfo` prefill followed by `PlayData` does not, at any feed
-rate, with `lost` and `corrupt` reporting zero throughout. `--stream-probe`
-does not settle it: it measures how fast `PlayData` calls return, not that a
-sample reached W1. Parked behind `--motion-stream`.
+**Closed: streamed video is not achievable on this unit.** `PlayData`
+streaming works — `--motion-stream` sustains the colour rate indefinitely with
+a clean feed — but the device loses and gains whole **32-sample blocks** at
+about 900 per second, which is 15 timing displacements of 2.24 µs per field
+and far more than a monitor's vertical lock will absorb.
+
+Established against a hardware control (`funcSquare`, no streaming in the
+path), which measured clean to ±0.003 samples over 5,714 half-periods:
+
+| source | defects |
+|---|---|
+| `funcSquare`, hardware | **none**, median 100.000 (99.997..100.003) |
+| `funcPlayPattern`, streamed | **36 of 5,718**, range 0.912..132.001 |
+
+The event rate is fixed rather than throughput-dependent — dropping to
+11.111 MS/s left it at ~825/s and made the net loss worse (0.087% → 0.254%)
+— and `lost`/`corrupt` report zero throughout, so those counters cannot
+validate a stream. Full numbers in **[NTSC_FINDINGS.md](NTSC_FINDINGS.md)**.
+
+Use `--motion` (deep-memory loop) for a clean picture. The streaming path is
+kept for signals tolerant of 0.1% sample loss.

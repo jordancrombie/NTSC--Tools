@@ -218,12 +218,33 @@ stream -- and `lost`/`corrupt` report zero throughout.
 5,720 against 36 of 5,720 unaligned, net -696 against -655. The device drops
 blocks regardless of how the writes are shaped.
 
+**The event rate is FIXED, not throughput-dependent, so no sample rate is
+clean.** Measured at two rates, both with a clean feed and a clean hardware
+control:
+
+| div | MS/s | defects | events/s | net lost/s | % of stream | us per block |
+|---|---|---|---|---|---|---|
+| 7 | 14.286 | 36/5,718 (0.63%) | 900 | 12,422 | 0.087% | 2.24 |
+| 9 | 11.111 | 33/4,455 (0.74%) | 825 | 28,200 | 0.254% | 2.88 |
+
+Dropping the rate by 22% did not reduce the event rate at all, and made the
+damage WORSE on both measures that matter: the net loss rose from 0.087% to
+0.254% of the stream, and each 32-sample block costs more time at a lower
+rate (2.24 us to 2.88 us). ~850-900 events per second is close to the 1 kHz
+USB frame rate -- about one lost block per frame -- but whatever the
+mechanism, it is fixed-rate and below anything the host controls.
+
 **Consequence for video.** Fifteen 2.24 us displacements per field is far more
 than a monitor's AFC or vertical lock will absorb, which is why the streamed
-picture rolls and twists while the identical content played from deep memory
-is perfect. There is no host-side fix: the feed is already clean by every
-measure available (right rate, positive fill, zero counters, generation at 5%
-of budget).
+picture rolls and twists while identical content from deep memory is perfect.
+There is no host-side fix: the feed is already clean by every measure
+available (right rate, positive fill, zero counters, generation at 5-10% of
+budget, GC disabled), and no rate at which the device is clean.
+
+**So streamed video is not achievable on this unit.** The streaming
+architecture works and is worth keeping -- it sustains the colour rate
+indefinitely and would be fine for audio or any signal tolerant of 0.1%
+sample loss -- but a clean picture has to come from the deep-memory loop.
 
 **Two diagnostics in this project broke what they measured.** `AnalogOutStatus`
 at 10 Hz cost 1792 us of a 2.29 ms FIFO, and the first `--stream-square`
