@@ -3233,21 +3233,45 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
 
             if capture_at is not None and cap_state != "done":
                 if cap_state == "idle" and now >= capture_at:
-                    dwf.FDwfAnalogInFrequencySet(hdwf,
-                                                 ctypes.c_double(scope_rate))
-                    dwf.FDwfAnalogInBufferSizeSet(hdwf, ctypes.c_int(cap_n))
-                    dwf.FDwfAnalogInConfigure(hdwf, ctypes.c_int(1),
-                                              ctypes.c_int(1))
-                    print(f"  arming scope at {now:.1f} s: {cap_n:,} samples, "
-                          f"{capture_s * 1000:.1f} ms at "
-                          f"{scope_rate / 1e6:.0f} MS/s")
+                    # Every one of these was unchecked, and a refused
+                    # BufferSizeSet leaves StatusData filling nothing -- which
+                    # reads as a FLAT capture and looks like a dead cable.
+                    bmin, bmax = ctypes.c_int(), ctypes.c_int()
+                    check(dwf, dwf.FDwfAnalogInBufferSizeInfo(
+                        hdwf, ctypes.byref(bmin), ctypes.byref(bmax)),
+                        "InBufferSizeInfo")
+                    if cap_n > bmax.value:
+                        print(f"  capture clamped {cap_n:,} -> {bmax.value:,} "
+                              f"samples (device maximum)")
+                        cap_n = bmax.value
+                    check(dwf, dwf.FDwfAnalogInFrequencySet(
+                        hdwf, ctypes.c_double(scope_rate)), "InFrequencySet")
+                    check(dwf, dwf.FDwfAnalogInBufferSizeSet(
+                        hdwf, ctypes.c_int(cap_n)), "InBufferSizeSet")
+                    check(dwf, dwf.FDwfAnalogInConfigure(
+                        hdwf, ctypes.c_int(1), ctypes.c_int(1)),
+                        "InConfigure")
+                    gf, gn = ctypes.c_double(), ctypes.c_int()
+                    check(dwf, dwf.FDwfAnalogInFrequencyGet(
+                        hdwf, ctypes.byref(gf)), "InFrequencyGet")
+                    check(dwf, dwf.FDwfAnalogInBufferSizeGet(
+                        hdwf, ctypes.byref(gn)), "InBufferSizeGet")
+                    print(f"  arming scope at {now:.1f} s: asked {cap_n:,} "
+                          f"samples at {scope_rate / 1e6:.0f} MS/s, device "
+                          f"gave {gn.value:,} at {gf.value / 1e6:.3f} MS/s "
+                          f"(range {bmin.value:,}..{bmax.value:,})")
+                    if gn.value != cap_n:
+                        print(f"  NOTE: buffer is {gn.value:,}, not "
+                              f"{cap_n:,}; reading the smaller count")
+                        cap_n = gn.value
                     cap_state = "armed"
                     cap_armed_at = now
                     t_cap = now + 0.05
                 elif cap_state == "armed" and now >= t_cap:
                     t_cap = now + 0.05
-                    dwf.FDwfAnalogInStatus(hdwf, ctypes.c_int(0),
-                                           ctypes.byref(in_sts))
+                    check(dwf, dwf.FDwfAnalogInStatus(
+                        hdwf, ctypes.c_int(0), ctypes.byref(in_sts)),
+                        "InStatus(poll)")
                     if (in_sts.value != DwfStateDone
                             and now - cap_armed_at > 10.0):
                         print(f"  capture timed out after 10 s in state "
@@ -3257,11 +3281,13 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                     elif in_sts.value == DwfStateDone:
                         print(f"  acquired at {now:.1f} s "
                               f"(lost {t_lost:,}, corrupt {t_corr:,} so far)")
-                        dwf.FDwfAnalogInStatus(hdwf, ctypes.c_int(1),
-                                               ctypes.byref(in_sts))
+                        check(dwf, dwf.FDwfAnalogInStatus(
+                            hdwf, ctypes.c_int(1), ctypes.byref(in_sts)),
+                            "InStatus(read)")
                         buf = (ctypes.c_double * cap_n)()
-                        dwf.FDwfAnalogInStatusData(hdwf, ctypes.c_int(0), buf,
-                                                   ctypes.c_int(cap_n))
+                        check(dwf, dwf.FDwfAnalogInStatusData(
+                            hdwf, ctypes.c_int(0), buf, ctypes.c_int(cap_n)),
+                            "InStatusData")
                         samples = list(buf)
                         cap_state = "done"
                         if capture_path:
@@ -3368,6 +3394,14 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
     geom = motion_geometry(spl, rate)
     fill_fn = make_motion_filler(bg, total, geom, ball_n, blank_n, rate)
 
+    if STREAM_CAPTURE_AT is not None:
+        # Before the AWG, matching the order feed_one_config used -- which did
+        # read CH1 correctly in this configuration. setup_scope documents that
+        # the first acquisition after a range change is wrong, so discard one;
+        # doing it here costs the feed nothing because nothing is streaming yet.
+        setup_scope(dwf, hdwf)
+        capture(dwf, hdwf, 25e6, 1 << 16)              # discard: settling
+
     check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
     dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
     check(dwf, dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
@@ -3412,14 +3446,6 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
               "trustworthy `free`.\n"
               "      This WILL underrun and break the picture. Diagnostic only.")
     print("\nStreaming unbounded motion. Press Ctrl+C to stop.")
-    if STREAM_CAPTURE_AT is not None:
-        setup_scope(dwf, hdwf)
-        # Mandatory, and documented in setup_scope: the FIRST acquisition
-        # after a range change comes back at the wrong level. Every other
-        # caller in this file discards one; skipping it here produced a
-        # capture with 38,755 one-sample "pulses" and no sync at all. Do it
-        # before the AWG starts, so it costs the feed nothing.
-        capture(dwf, hdwf, 25e6, 1 << 16)              # discard: settling
     stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo,
                 rate_check=STREAM_RATE_CHECK, spl_hint=spl,
                 capture_at=STREAM_CAPTURE_AT, capture_path=SAVE_CAPTURE)
