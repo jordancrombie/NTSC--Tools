@@ -2862,6 +2862,11 @@ STREAM_SQUARE = 0
 # rate fails. Below the ceiling `free` is always valid, so there is no
 # estimate to drift and nothing to overfeed.
 STREAM_DOC = False
+# --stream-pad N / --stream-pad-every M: insert N padding samples every M real
+# samples, so the 32-sample block the FIFO discards on each wrap is padding
+# instead of picture. Defaults match the measured defect: 32 every 32,768.
+STREAM_PAD = 0
+STREAM_PAD_EVERY = 32768
 DWF_STATE_NAMES = {DwfStateArmed: "armed", DwfStateDone: "done",
                    DwfStateRunning: "running", DwfStateWait: "wait"}
 
@@ -3613,6 +3618,56 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                   f"{line_hz / 262.5:.4f} Hz (NTSC 59.9401)")
 
 
+def make_padded_filler(inner, pad_n, every, fifo):
+    """Wrap a fill_fn to insert `pad_n` padding samples every `every` real ones.
+
+    Pre-compensation for the device's FIFO-wrap loss. The ring buffer discards
+    exactly 32 samples per 32,768-sample revolution -- deterministic, measured
+    as defects of exactly -32.00 samples spaced exactly 32,800 apart (32,800
+    minus the 32 that vanish is the 32,768 FIFO). So feeding 32 padding
+    samples at that cadence means the block the device throws away is padding
+    rather than picture.
+
+    This fixes the TIMING even when the phase is wrong, which is what matters:
+    a mis-phased pad costs one local glitch of about 64 samples but the sample
+    count per revolution still balances, so nothing accumulates and the
+    picture stops rolling. Padding is a hold of the last real sample, so the
+    artifact is a brief smear rather than a jump.
+
+    `inner` is called with a content position that advances only over real
+    samples, so the signal it generates is never itself distorted.
+    """
+    scratch = (ctypes.c_double * fifo)()
+    st = {"since": 0, "pad_left": 0, "pos": 0, "last": 0.0,
+          "pads": 0, "real": 0}
+
+    def fill(dst, _abs_pos, n):
+        i = 0
+        while i < n:
+            if st["pad_left"] > 0:
+                m = min(st["pad_left"], n - i)
+                v = st["last"]
+                for j in range(m):
+                    dst[i + j] = v
+                st["pad_left"] -= m
+                i += m
+                continue
+            m = min(every - st["since"], n - i)
+            inner(scratch, st["pos"], m)
+            ctypes.memmove(ctypes.byref(dst, i * 8), scratch, m * 8)
+            st["last"] = scratch[m - 1]
+            st["pos"] += m
+            st["since"] += m
+            st["real"] += m
+            i += m
+            if st["since"] >= every:
+                st["since"] = 0
+                st["pad_left"] = pad_n
+                st["pads"] += 1
+    fill.stats = st
+    return fill
+
+
 def make_square_filler(half_n, lo=-0.9, hi=0.9):
     """A fill_fn producing a square wave toggling every `half_n` samples.
 
@@ -3874,6 +3929,17 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
     check(dwf, dwf.FDwfAnalogOutNodeDataInfo(hdwf, ch, AnalogOutNodeCarrier, 0,
                                              ctypes.byref(cbuf)), "DataInfo")
     fifo = max(1, cbuf.value)
+    if STREAM_PAD:
+        # Wrap here, not earlier: the padding needs the FIFO size for its
+        # scratch buffer, and the prime must already be padded so the cadence
+        # starts in phase with the very first samples the device sees.
+        fill_fn = make_padded_filler(fill_fn, STREAM_PAD, STREAM_PAD_EVERY,
+                                     fifo)
+        print(f"      --stream-pad: {STREAM_PAD} hold samples every "
+              f"{STREAM_PAD_EVERY:,} real ones "
+              f"({STREAM_PAD / (STREAM_PAD_EVERY + STREAM_PAD) * 100:.4f}%), "
+              f"pre-compensating the\n      FIFO-wrap loss so the discarded "
+              f"block is padding rather than picture")
     prime = (ctypes.c_double * fifo)()
     fill_fn(prime, 0, fifo)
     check(dwf, dwf.FDwfAnalogOutNodeDataSet(
@@ -4669,7 +4735,7 @@ def main():
             "--bar-amp", "--motion-seconds", "--stream-capture",
             "--stream-func", "--stream-align", "--stream-resync",
             "--stream-guard", "--stream-capture-s", "--stream-div",
-            "--stream-square"}
+            "--stream-square", "--stream-pad", "--stream-pad-every"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -4704,7 +4770,7 @@ def main():
     global SOURCE_SERIES_75R, MOTION_SECONDS, STREAM_RATE_CHECK
     global STREAM_CAPTURE_AT, STREAM_FUNC, STREAM_STATIC, STREAM_ALIGN
     global STREAM_RESYNC_S, STREAM_GUARD, STREAM_CAPTURE_S, STREAM_SQUARE
-    global STREAM_DOC
+    global STREAM_DOC, STREAM_PAD, STREAM_PAD_EVERY
     # --locked: the combination measured to lock a Leader LV5700A through a
     # vectorscope-and-monitor chain. Individual flags still override it.
     if "--locked" in argv:
@@ -4730,6 +4796,9 @@ def main():
     STREAM_CAPTURE_S = opt("--stream-capture-s", float, STREAM_CAPTURE_S)
     STREAM_SQUARE = max(0, opt("--stream-square", int, 0))
     STREAM_DOC = "--stream-doc" in argv
+    STREAM_PAD = max(0, opt("--stream-pad", int, 0))
+    STREAM_PAD_EVERY = max(1, opt("--stream-pad-every", int,
+                                  STREAM_PAD_EVERY))
     STREAM_FUNC = opt("--stream-func", str, STREAM_FUNC)
     if STREAM_FUNC not in ("play", "pattern"):
         raise RuntimeError("--stream-func must be 'play' or 'pattern'.")

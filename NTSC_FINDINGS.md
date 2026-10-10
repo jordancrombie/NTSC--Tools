@@ -260,6 +260,32 @@ at 16, 64, 128, 256 and 512 MiB, `DataInfo` max stayed 32,768 every time. So
 the FIFO depth is fixed and the trap cannot be opened from the host: a valid
 `free` costs more time than the buffer holds.
 
+**Pre-compensation implemented, and it does NOT work: the loss is
+phase-locked to a FIFO address we cannot control.** `--stream-pad 32
+--stream-pad-every 32768` inserts 32 hold samples per 32,768 real ones so the
+discarded block should be padding. Verified byte-correct offline (content
+position advances only over real samples, padding is a hold of the last real
+sample, 0 of 4,200 samples differ from expectation). On hardware, with the
+documented loop at 10 MS/s so overfeeding does not confound it:
+
+| | spacing between defects | net sample error |
+|---|---|---|
+| no padding | 328 half-periods, range 328..328 | **-384.0** |
+| 32 per 32,768 | 23 half-periods, range 1..304 | **-384.0** |
+
+**Identical net loss.** The padding is not replacing the dropped block; the
+drop still lands on real samples, and the padding merely scatters the defects
+(regular 328 spacing becomes irregular 1..304) and adds +/-64-sample signatures
+where a pad and a drop interact. That signature confirms the mechanism -- the
+device really is discarding a block at a ring boundary -- but the boundary is
+a fixed FIFO ADDRESS, and our write offsets never line up with it.
+
+Aligning it would need the ring phase, and nothing in the API exposes it.
+Writing exactly `fifo` samples per call would pin the phase, but a write can
+only be as large as `free`, which is only 32,768 when the buffer is empty --
+i.e. when it is already underrunning. Sweeping blindly is 1,024 distinct
+32-aligned phases at ~10 s per test. So this is a dead end from the host.
+
 **The event rate is FIXED, not throughput-dependent, so no sample rate is
 clean.** Measured at two rates, both with a clean feed and a clean hardware
 control:
