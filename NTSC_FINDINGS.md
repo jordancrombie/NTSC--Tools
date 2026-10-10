@@ -161,6 +161,401 @@ data `(v − 0.5) / 0.5`.
 **Vertical-interval lines sit at BLANKING (0 IRE), not black.** The 7.5 IRE
 setup pedestal applies to active picture only.
 
+**A 75 ohm series resistor does not raise the level — it cannot.** The AWG is
+a near-zero-impedance source. Compare, at a 75 ohm terminated load:
+
+| | AWG drive | at the load |
+|---|---|---|
+| no resistor, no flag | 1.00 V p-p | **1.00 V p-p** |
+| 75 ohm + `--series-75` (x2) | 2.00 V p-p | **1.00 V p-p** |
+
+Identical. `--series-75` doubles the drive and the 75/75 divider halves it
+back. The resistor buys a correct *source impedance* (no reflection off an
+unterminated stub — the usual cause of edge overshoot), not amplitude. Level is
+`--level`, and with the resistor fitted `--level` means the same thing at the
+load as it did without it.
+
+**STRATEGY A WORKS: `Configure(ch, 3)` swaps a running `funcPlay` buffer with
+no glitch.** Measured with `--dual-probe`, which re-applies IDENTICAL data to a
+running channel so any defect is attributable to the apply itself, and uses a
+buffer that is a whole number of square periods so a restart would show as a
+phase jump:
+
+| applies in a 100 ms window | half-periods | defects |
+|---|---|---|
+| 0 (baseline) | 6,893 | 1 (0.01%) |
+| 2 | 12,842 | **0 — clean** |
+| **4** | **14,285** | **0 — clean**, range 99.997..100.004 |
+| 2, with the AD3 sacrificial workaround | 14,287 | 5 (0.03%) |
+
+Compare streamed `PlayData` at the same rate: 0.63% of half-periods defective.
+**Apply is clean; streaming is not.**
+
+The AD3 "sacrificial pair of applies" workaround is **harmful here** -- nudging
+the frequency by 0.01 Hz and back perturbs timing and produced the only
+defects in the set. Do not use it on this device.
+
+**Two constraints on using it:**
+
+1. **`DataSet` silently does nothing below about 2,000,000 samples.** With
+   `DataSet` of all +1.0 at amplitude 0.5, the output should be a flat
+   +500 mV. Measured: 200,000 samples gave -510..+510 mV (stale deep-memory
+   video, median +27), both with a bounded run and with run 0; 2,000,000
+   samples gave +496.6..+507.6 mV, flat. The call returns success either way.
+   This is why both earlier deep-memory square-wave controls came back as
+   video and why I read it as a device defect.
+
+2. **The swap is IMMEDIATE, not deferred to a buffer wrap.** Applying a buffer
+   with a different half-period and bucketing the capture into 10 ms slices:
+
+   | slice | median half-period | |
+   |---|---|---|
+   | 0-20 ms | 150 | stale content from the previous process -- deep memory persists |
+   | 20-60 ms | 100 | our initial `DataSet` takes effect ~20 ms in |
+   | 60-300 ms | 150 | the apply lands at ~60 ms, when `DataSet` returned at 61.3 ms |
+
+   The buffer period was 140 ms, so a deferred swap would have landed at
+   140 ms. It landed when the upload completed. So new content replaces old
+   under the playhead, and an apply issued mid-pass changes the remainder of
+   that pass.
+
+**Design that follows.** Buffer = M whole four-field sequences (>= 2 M
+samples). Sync structure is identical in every pass -- only the ball position
+differs -- so a mid-buffer swap cannot disturb sync timing at all; the worst
+case is the ball jumping by one buffer period of travel. Timing the upload to
+complete just after a wrap reduces even that toward zero.
+
+**MEASURED: streamed PlayData loses and gains whole 32-SAMPLE BLOCKS.**
+Found with `--stream-square`, which streams a square wave of known
+half-period in samples and measures each half-period back; DC cannot show a
+dropped sample and video is too tangled to attribute one. On a clean feed
+(chunk generation 5.7% of budget, 14.292 MS/s fed, fill positive throughout,
+`lost` and `corrupt` both 0):
+
+| | |
+|---|---|
+| defects | 36 of 5,720 half-periods (0.63%) |
+| size | always a whole 32-sample block: -32.00, +32.00, or split (-23.09 with -8.00) |
+| rate | ~900/s, about 15 per field |
+| each worth | 2.24 us of timing displacement at 14.286 MS/s |
+| net | -655 samples per 40 ms, 16,378/s lost, 0.115% of the stream |
+| spacing | irregular, median 158 half-periods, range 1..328 |
+
+The irregular spacing rules out the sequence wrap and any fixed chunk
+boundary. `lost` and `corrupt` report zero throughout, so **those counters
+cannot be used to validate a stream** -- this is the third time they have read
+clean on a measurably broken one.
+
+15 displacements of 2.24 us per field is ample to keep a monitor's AFC and
+vertical lock unsettled, which matches a picture that rolls, twists, and
+tracks feed health rather than content.
+
+**CONFIRMED against a hardware control.** The same square wave, the same
+scope settings, the same analysis, differing only in how the samples reach the
+DAC:
+
+| source | edges (5,714 expected) | defects | median half-period |
+|---|---|---|---|
+| `funcSquare`, generated in hardware | 5,715 | **none** | 100.000 (99.997..100.003) |
+| `funcPlayPattern`, streamed | 5,719 | **36 of 5,718** | 100.000, range 0.912..132.001 |
+
+The control is clean to **+/-0.003 samples**, so the DAC and the capture path
+are sound and the streamed defects are real. Streaming on this device loses
+and gains whole 32-sample blocks at about 900 per second -- 0.115% of the
+stream -- and `lost`/`corrupt` report zero throughout.
+
+**Not caused by our write sizes.** `--stream-align 32` changed nothing: 38 of
+5,720 against 36 of 5,720 unaligned, net -696 against -655. The device drops
+blocks regardless of how the writes are shaped.
+
+**ROOT CAUSE: one 32-sample block is lost per FIFO revolution.** Found by
+running the SDK's documented loop (`--stream-doc`) instead of the clock-paced
+one, which removes the overfeeding and leaves only the device's own defect:
+
+| | |
+|---|---|
+| defects | 14 of 4,448 half-periods |
+| size | **every one exactly -32.00 samples** |
+| spacing | **328 half-periods = 32,800 samples, range 328..328** |
+
+32,800 - 32 = **32,768**, the FIFO size exactly. So the gap between losses is
+one FIFO consumed plus the 32 that vanished: the ring buffer drops a
+32-sample block every time it wraps. 32/32,800 = **0.0976%**, deterministic,
+and independent of congestion, scheduling or how we shape our writes -- which
+is why `--stream-align 32` changed nothing.
+
+The clock-paced loop shows this PLUS irregular extra losses (0.2538% against
+0.1008% for the documented loop at the same rate). Those extras are
+overfeeding -- my first theory, which I abandoned for the wrong reason: the
+guard band I added to test it also shrank the chunk and starved the feed, and
+I read the starvation as a refutation.
+
+**Why the documented loop is not a fix either.** It costs 2470 us per pass
+(AnalogOutStatus 1393 + PlayData 1077, the latter FLAT regardless of size)
+while the FIFO holds only 2294 us at 14.286 MS/s, so the colour rate is
+structurally out of reach -- the buffer empties before the next refill can
+arrive. The arithmetic says 11.111 MS/s should fit (2949 us of FIFO), but
+measured it sustained only 8.769 MS/s, so PlayData evidently blocks when the
+buffer is full and the real per-pass cost is higher than the isolated timing.
+
+| call | cost | notes |
+|---|---|---|
+| `FDwfAnalogOutStatus` | 1393 us | the only real device round trip |
+| `FDwfAnalogOutNodePlayData` | ~1077 us | FLAT from 1 Ki to 32 Ki samples |
+| `FDwfAnalogOutNodePlayStatus` | 0.7 us | local read of cached state |
+| `FDwfDeviceParamGet` | 0.4 us | local |
+
+`analogout-memory:#` in `FDwfDeviceOpenEx` does NOT deepen the FIFO -- tried
+at 16, 64, 128, 256 and 512 MiB, `DataInfo` max stayed 32,768 every time. So
+the FIFO depth is fixed and the trap cannot be opened from the host: a valid
+`free` costs more time than the buffer holds.
+
+**Pre-compensation implemented, and it does NOT work: the loss is
+phase-locked to a FIFO address we cannot control.** `--stream-pad 32
+--stream-pad-every 32768` inserts 32 hold samples per 32,768 real ones so the
+discarded block should be padding. Verified byte-correct offline (content
+position advances only over real samples, padding is a hold of the last real
+sample, 0 of 4,200 samples differ from expectation). On hardware, with the
+documented loop at 10 MS/s so overfeeding does not confound it:
+
+| | spacing between defects | net sample error |
+|---|---|---|
+| no padding | 328 half-periods, range 328..328 | **-384.0** |
+| 32 per 32,768 | 23 half-periods, range 1..304 | **-384.0** |
+
+**Identical net loss.** The padding is not replacing the dropped block; the
+drop still lands on real samples, and the padding merely scatters the defects
+(regular 328 spacing becomes irregular 1..304) and adds +/-64-sample signatures
+where a pad and a drop interact. That signature confirms the mechanism -- the
+device really is discarding a block at a ring boundary -- but the boundary is
+a fixed FIFO ADDRESS, and our write offsets never line up with it.
+
+Aligning it would need the ring phase, and nothing in the API exposes it.
+Writing exactly `fifo` samples per call would pin the phase, but a write can
+only be as large as `free`, which is only 32,768 when the buffer is empty --
+i.e. when it is already underrunning. Sweeping blindly is 1,024 distinct
+32-aligned phases at ~10 s per test. So this is a dead end from the host.
+
+**The event rate is FIXED, not throughput-dependent, so no sample rate is
+clean.** Measured at two rates, both with a clean feed and a clean hardware
+control:
+
+| div | MS/s | defects | events/s | net lost/s | % of stream | us per block |
+|---|---|---|---|---|---|---|
+| 7 | 14.286 | 36/5,718 (0.63%) | 900 | 12,422 | 0.087% | 2.24 |
+| 9 | 11.111 | 33/4,455 (0.74%) | 825 | 28,200 | 0.254% | 2.88 |
+
+Dropping the rate by 22% did not reduce the event rate at all, and made the
+damage WORSE on both measures that matter: the net loss rose from 0.087% to
+0.254% of the stream, and each 32-sample block costs more time at a lower
+rate (2.24 us to 2.88 us). ~850-900 events per second is close to the 1 kHz
+USB frame rate -- about one lost block per frame -- but whatever the
+mechanism, it is fixed-rate and below anything the host controls.
+
+**Consequence for video.** Fifteen 2.24 us displacements per field is far more
+than a monitor's AFC or vertical lock will absorb, which is why the streamed
+picture rolls and twists while identical content from deep memory is perfect.
+There is no host-side fix: the feed is already clean by every measure
+available (right rate, positive fill, zero counters, generation at 5-10% of
+budget, GC disabled), and no rate at which the device is clean.
+
+**So streamed video is not achievable on this unit.** The streaming
+architecture works and is worth keeping -- it sustains the colour rate
+indefinitely and would be fine for audio or any signal tolerant of 0.1%
+sample loss -- but a clean picture has to come from the deep-memory loop.
+
+**Two diagnostics in this project broke what they measured.** `AnalogOutStatus`
+at 10 Hz cost 1792 us of a 2.29 ms FIFO, and the first `--stream-square`
+filler wrote samples from Python at 2.761 ms per chunk against the same
+budget -- it reported its own starvation as 31 device defects. `stream_feed`
+now refuses to start when chunk generation exceeds 30% of the FIFO budget.
+
+**SETTLED: PlayData streams ONLY where play memory is 0.** Measured with
+`--feed-matrix`, which primes DC at -0.5 V and streams DC at +0.5 V so the
+capture says which one is on the wire. Both SDK recipes, all six
+configurations:
+
+| cfg | play memory | max cFree | fed MS/s | CH1 | |
+|---|---|---|---|---|---|
+| 0 | 67,108,864 | 67,098,880 | 63.2 | **-0.499** | loops the prime |
+| 1 | 0 | 16,360 | 1.9 | **+0.502** | **streams** |
+| 2 | 67,108,864 | 67,105,536 | 64.0 | **-0.499** | loops the prime |
+| 3 | 134,217,728 | 134,202,624 | 72.3 | **-0.499** | loops the prime |
+| 4 | 0 | 32,680 | 2.1 | **+0.502** | **streams** |
+| 5 | 0 | 32,688 | 2.0 | **+0.502** | **streams** |
+
+The deep-memory configurations accept PlayData at 63-72 MS/s, report zero
+lost and zero corrupted, and play the primed buffer on loop instead. The
+counters never complain, so only a capture tells you. `pick_deep_config`
+selects the deepest play memory, which is therefore the WORST choice for
+streaming -- that is why `--motion`'s streaming path was dead while `--stream`
+(which uses `pick_config`, preferring play size 0) produced video.
+
+**Our call sequence matched neither shipped recipe.** From the SDK samples:
+
+| | AnalogOut_Play.py | AnalogOut_PlayTest.py | what we had |
+|---|---|---|---|
+| function | funcPlay (31) | funcPlayPattern (29) | funcPlay |
+| repeat | RepeatSet(1) | not set | RepeatSet(0) |
+| run | RunSet(duration) | not set | RunSet(0.0) |
+| feed size | exactly cFree | exactly cFree | host-side budget |
+
+Both prime with the DataInfo size and `continue` when cFree is 0. **Feeding
+more than cFree is an error** -- that, not a device limitation, was the
+"PlayData refused" seen in the streaming configurations on the first attempt.
+
+**The rate ceiling is FIFO depth / loop period.** A streaming configuration
+has about 32,768 samples of FIFO, which is only 2.29 ms of video at the colour
+rate, so the whole feed loop has to complete inside 2.29 ms. Against a 1413 us
+round trip:
+
+| loop structure | period | max rate | |
+|---|---|---|---|
+| Status + PlayStatus + PlayData | 4.24 ms | 7.73 MS/s | short |
+| PlayStatus + PlayData | 2.83 ms | 11.60 MS/s | short |
+| PlayData only, paced | 1.41 ms | 23.19 MS/s | enough |
+
+**SETTLED by `--feed-tune`: colour streaming works at 14.295 MS/s.** The whole
+thing turns on one measurement -- the two status calls are not comparable:
+
+| call | cost in a streaming config |
+|---|---|
+| `FDwfAnalogOutStatus` | **1792 us** |
+| `FDwfAnalogOutNodePlayStatus` | **2 us** |
+
+900x apart, and that explains every row:
+
+| loop | max clean | why |
+|---|---|---|
+| Status + PlayStatus + PlayData | 2.0 MS/s | `AnalogOutStatus` in the hot loop |
+| PlayStatus + PlayData | **0** | stale `free`, fed nothing, looped the prime |
+| **PlayData paced, PlayStatus every 100 ms** | **14.286 MS/s** | neither problem |
+
+The two constraints look contradictory and are not: `PlayStatus` returns
+STALE values unless `AnalogOutStatus` is called, but `AnalogOutStatus` is far
+too slow to call per iteration. Pacing the FIFO fill against the wall clock
+needs neither -- the device consumes at exactly the rate we set, so
+`fill = fed - elapsed * rate`. `PlayStatus` is then polled occasionally
+purely to read the lost and corrupted counters. The 2-call row is the proof
+of the stale-`free` half: 0.000 MS/s fed and CH1 sitting on the primed level.
+
+Note the SDK examples use the 3-call form, which is correct and clean -- just
+only to about 2 MS/s on this unit. Audio does not need more.
+
+**The working recipe for feeding arbitrary data:**
+
+1. `pick_stream_config()` -- play memory 0, deepest scope buffer (config 5)
+2. `funcPlayPattern`, run and repeat left at their defaults
+3. prime `DataInfo` samples (32768 = 2.29 ms at the colour rate)
+4. feed with `PlayData` only, sized from a clock-paced fill estimate
+5. poll `PlayStatus` every 100 ms for the counters, never for sizing
+6. generate the signal PER CHUNK, never per frame or per sequence
+
+**The 2.29 ms FIFO is the whole design constraint.** Everything the feed loop
+does between `PlayData` calls is spent against it, and two things that look
+harmless do not fit:
+
+| work | cost | share of a 2.29 ms FIFO |
+|---|---|---|
+| `FDwfAnalogOutStatus` | 1792 us | **78%** |
+| rebuilding a 953,400-sample sequence on wrap | 800 us | **35%** |
+| `FDwfAnalogOutNodePlayStatus` | 2 us | 0% |
+| generating one 32,768-sample chunk on demand | 22 us | **1%** |
+
+Adding the first two to a loop that had measured clean cost 2.3% of all
+samples, dropped in FIFO-sized chunks -- 32,768 lost per 100 ms poll, minimum
+fill -2.59 ms. That dropout rate breaks sync and rolls the picture. Note the
+rate itself was fine: measured -0.052%, a field rate of 59.9035 Hz against
+59.9401 nominal, which a CRT holds comfortably. **Rolling was the dropouts,
+not the timing.**
+
+So generate on demand: `fill_fn(dst, abs_pos, n)` writes n samples starting at
+an absolute sample index. Per chunk that is a 262 KB memmove plus a few short
+runs -- 22 us against 800 us for the same work done per sequence, and no stall
+concentrated at a wrap. Verified byte-identical to building whole sequences,
+including chunks that straddle a sequence boundary.
+
+What works, and what `--motion` now does: put the whole animation in ONE
+DataSet and let run 0 / repeat 0 loop it in hardware -- the same mechanism
+`--deep` uses for a static picture. 140 four-field sequences fit in play
+memory (133,476,000 of 134,217,728 samples), which is 9.34 s at 1,068 MB of
+host doubles.
+
+A looping buffer is only seamless if the CONTENT closes too. Every four-field
+sequence already closes on a whole number of subcarrier cycles (238,875), so
+any whole number of them does; the ball does not, so its bounce must complete
+a whole number of cycles over the loop. The cycle counts must also be coprime
+and distinct -- equal counts put x and y in lockstep and the ball slides along
+one diagonal instead of bouncing. A short loop therefore forces fast motion:
+4.0 s gives 1.00 w/s, 9.34 s gives 0.428 w/s. That is the real trade, and
+memory is what buys slower motion.
+
+**`PlayStatus`'s `free` is writable space, not fill.** Feeding it directly is
+self-limiting: the buffer fills, then settles at the consumption rate. Do not
+derive an in-flight depth as `cap - free` and gate on it -- that inverts the
+test and feeds nothing. Bound overrun by capping the chunk instead (256 Ki
+measured clean, 4 Mi corrupted 211,200 samples). Observed values of `free` are
+not yet consistent between runs: `--stream-probe` saw it near the full 134 M
+after priming, while a full-sequence prime reported 890,585. A feed policy
+that only requires `free > 0` is immune to the difference.
+
+**OPEN: `--series-75` doubled the drive and the reading went DOWN.** Measured
+with a 75 ohm resistor fitted in series with W1, reading peak white off a flat
+100 IRE field (`--pattern white`) on the Leader:
+
+| run (resistor fitted both times) | AWG drive | read at the Leader | implied path gain |
+|---|---|---|---|
+| `--level 1.0` (no flag) | 1.00 V p-p | **100 IRE** | 1.00 |
+| `--level 1.0 --series-75` | 2.00 V p-p | **72 IRE** | 0.36 |
+
+**These are mutually inconsistent.** A passive linear chain cannot produce less
+output from more drive, so no single path gain explains both rows. Candidates,
+none yet confirmed:
+
+1. The larger amplitude/offset request is being clamped by the configuration.
+   `report_output_window()` now reads back what the AWG actually accepted,
+   against its real limits, in all three generation paths -- added precisely to
+   settle this without guessing.
+2. The Leader was overloaded on the second row (2 V p-p into an input expecting
+   1 V) and the reading is not meaningful.
+3. The resistor is not in series the way it looks, or is not 75 ohm.
+4. Something else moved between the runs (a termination switch, the Leader's
+   gain/scale setting).
+
+Note row 1's gain of 1.00 implies the chain is **unterminated**, since a 75 ohm
+series resistor into a 75 ohm load would read 50 IRE. That contradicts a
+monitor that is displaying a picture, which is a further reason to distrust the
+model rather than the measurements.
+
+**Lesson, again:** the two changes in that A/B were *designed* to cancel
+(resistor + x2 at gain 0.50 == no resistor + x1 at gain 1.00, both 100 IRE), so
+when they didn't cancel I reached for a cause. I assumed the resistor had been
+removed, concluded "double termination, or a 133 ohm resistor", and wrote it up
+with a confident table. The premise was wrong. Confirm what changed between two
+runs before explaining why they differ.
+
+**75% bars cannot reach 100 IRE.** Peak white is `setup + 0.925 x 0.75` =
+**76.88 IRE**, and `--locked` carries `--level 0.9`, so the default command
+tops out at **69.2 IRE**. That is correct, not a loss. Calibrate level against
+`--pattern white` (a flat 100.00 IRE field, no chroma) or use `--bar-amp 100`
+for full-amplitude bars, where chroma peaks reach 134 IRE.
+
+**The setup pedestal is a variant, not a constant.** 7.5 IRE is NTSC-M (North
+America); NTSC-J (Japan) and much modern gear use **zero setup**, where black
+and blanking coincide. `--setup <IRE>` selects it, and three things have to
+move together or saturation stops matching luma:
+
+| | 7.5 IRE setup | zero setup |
+|---|---|---|
+| black | 0.3393 V (+7.5 IRE) | 0.2857 V (0 IRE) |
+| luma map | `0.075 + 0.925·Y` | `Y` |
+| chroma gain | 0.925 | 1.0 |
+| 75% bar peak white | 76.88 IRE | 75.00 IRE |
+
+The pedestal costs active range, so chroma takes the same `1 − setup` gain the
+luma compression applies. Sync depth, blanking and burst amplitude do not move.
+At zero setup `--vbi-black` becomes a no-op, since black *is* blanking.
+
 **Interlace — the one that caused the flagging:**
 - 525 lines, two fields of 262.5, field 59.94 Hz, frame 29.97 Hz
 - **Horizontal sync runs on ONE continuous grid for the entire frame.** The
