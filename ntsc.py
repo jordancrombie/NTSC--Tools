@@ -3992,6 +3992,87 @@ def feed_one_config(dwf, cfg, recipe, target, secs=1.2):
         dwf.FDwfDeviceClose(hdwf)
 
 
+enumfilterAll = ctypes.c_int(0)
+enumfilterUSB = ctypes.c_int(1)
+enumfilterNetwork = ctypes.c_int(2)
+
+
+def transport_info(dwf):
+    """Which transport is the device on, and what does a round trip cost?
+
+    FDwfAnalogOutStatus measured 1792-1881 us on this device. For USB that is
+    absurd -- a status read should be tens of microseconds -- and the SDK's own
+    documented feed loop calls it once per iteration, which is why that loop
+    tops out near 1-2 MS/s here. A network hop would explain the figure
+    exactly, and Digilent's forums carry reports of streaming discontinuities
+    specific to Ethernet. enumfilterUSB and enumfilterNetwork settle it.
+    """
+    print("\nTransport:")
+    found = {}
+    for name, filt in (("USB", enumfilterUSB),
+                       ("Network", enumfilterNetwork),
+                       ("all", enumfilterAll)):
+        n = ctypes.c_int()
+        if dwf.FDwfEnum(filt, ctypes.byref(n)) != 1:
+            print(f"  {name:8} enumeration failed: {last_error(dwf)}")
+            continue
+        found[name] = n.value
+        names = []
+        for i in range(n.value):
+            nb, sb = (ctypes.create_string_buffer(64),
+                      ctypes.create_string_buffer(64))
+            dwf.FDwfEnumDeviceName(ctypes.c_int(i), nb)
+            dwf.FDwfEnumSN(ctypes.c_int(i), sb)
+            names.append(f"{nb.value.decode()} {sb.value.decode()}")
+        print(f"  {name:8} {n.value} device(s)"
+              + ("".join(f"\n             {x}" for x in names) if names
+                 else ""))
+
+    if found.get("USB", 0) and not found.get("Network", 0):
+        print("\n  -> USB only. A 1792 us status round trip is NOT explained "
+              "by the\n     transport, and is worth reporting to Digilent.")
+    elif found.get("Network", 0) and not found.get("USB", 0):
+        print("\n  -> NETWORK only. That explains a 1792 us round trip, and "
+              "Digilent's\n     forums report streaming discontinuities "
+              "specific to Ethernet.\n     Connect the ADP2230 by USB and "
+              "re-run the integrity test.")
+    elif found.get("USB", 0) and found.get("Network", 0):
+        print("\n  -> BOTH available. FDwfDeviceOpen picks one; open with the "
+              "USB\n     filter to be sure which is in use.")
+
+    # Time a round trip on whatever the default open gives us.
+    hdwf = ctypes.c_int()
+    if dwf.FDwfDeviceOpen(ctypes.c_int(-1), ctypes.byref(hdwf)) != 1 \
+            or hdwf.value == 0:
+        print(f"  could not open a device: {last_error(dwf)}")
+        return found
+    try:
+        ch = ctypes.c_int(0)
+        sts = ctypes.c_ubyte()
+        free, lost, corr = (ctypes.c_int(), ctypes.c_int(), ctypes.c_int())
+        for label, fn in (
+                ("FDwfAnalogOutStatus",
+                 lambda: dwf.FDwfAnalogOutStatus(hdwf, ch,
+                                                 ctypes.byref(sts))),
+                ("FDwfAnalogOutNodePlayStatus",
+                 lambda: dwf.FDwfAnalogOutNodePlayStatus(
+                     hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                     ctypes.byref(lost), ctypes.byref(corr))),
+                ("FDwfDeviceParamGet",
+                 lambda: dwf.FDwfDeviceParamGet(
+                     hdwf, DwfParamFrequency, ctypes.byref(free)))):
+            t = time.time()
+            for _ in range(200):
+                fn()
+            us = (time.time() - t) / 200 * 1e6
+            print(f"  {label:30} {us:8.1f} us  "
+                  f"({1e6 / us:7.0f} calls/s)")
+        print("  Tens of microseconds is normal for USB; ~1800 us is not.")
+    finally:
+        dwf.FDwfDeviceClose(hdwf)
+    return found
+
+
 def feed_matrix(dwf, target=100e6 / 7):
     """Configuration x recipe: which combination puts a stream on W1?
 
@@ -4381,7 +4462,7 @@ def main():
              # device capability probes
              "--play-info", "--play-test", "--play-configs", "--pattern-info",
              "--clock-info", "--stream-probe", "--feed-matrix",
-             "--feed-tune",
+             "--feed-tune", "--transport",
              # A/B switches for things that were tested and are documented
              "--no-filter", "--sync-tip-zero", "--vbi-black",
              "--no-loop-align", "--fsc-nominal"}
@@ -4514,6 +4595,10 @@ def main():
 
     if "--pattern-info" in argv:
         pattern_info(dwf)
+        return
+
+    if "--transport" in argv:
+        transport_info(dwf)
         return
 
     if "--feed-matrix" in argv:
