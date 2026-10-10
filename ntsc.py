@@ -1434,7 +1434,9 @@ def calibrate_play_rate(dwf, hdwf, ch, func, requested=2e6):
     lo, hi = min(samples), max(samples)
     if hi - lo < 0.5:
         raise RuntimeError(f"Calibration saw no square wave on CH1 "
-                           f"({lo:+.3f}..{hi:+.3f} V). Jumper W1 to CH1.")
+                           f"({lo:+.3f}..{hi:+.3f} V). Jumper W1 to CH1, "
+                           f"or pass --play-scale 1.0 to skip calibration "
+                           f"(measured correct for this device).")
     mid = (lo + hi) / 2.0
     edges = [(i - 1 + (mid - samples[i - 1]) / (samples[i] - samples[i - 1])) * dt
              for i in range(1, len(samples))
