@@ -779,7 +779,7 @@ PLAY_SCALE_OVERRIDE = None
 MIN_SAMPLES_PER_SC = 3.0
 
 
-def choose_stream_timing(max_rate, colour=False):
+def choose_stream_timing(max_rate, colour=False, force_div=None):
     """Integer divider of the AWG clock with the most accurate line rate.
 
     Same divider constraint as funcCustom -- the rate must be AWG_CLOCK_HZ/N
@@ -792,16 +792,21 @@ def choose_stream_timing(max_rate, colour=False):
     """
     best = None
     max_rate = min(max_rate, STREAM_MAX_RATE)
-    for n in range(2, 40):
+    # Selecting on line-rate accuracy alone cannot express the real trade:
+    # a smaller divider samples the subcarrier better, a larger one needs less
+    # throughput. --stream-div names the divider directly.
+    span = (force_div, force_div + 1) if force_div else (2, 40)
+    for n in range(*span):
         rate = AWG_CLOCK_HZ / n
-        if rate > max_rate:
+        if rate > max_rate and not force_div:
             continue
         spl = round(rate / LINE_FREQ_HZ)
         spl += spl % 2                      # even: interlace needs half-lines
         if spl < 120:              # still far better than funcCustom's 54
             continue
         line_hz = rate / spl
-        if colour and rate / (SC_RATIO * line_hz) < MIN_SAMPLES_PER_SC:
+        if (colour and not force_div
+                and rate / (SC_RATIO * line_hz) < MIN_SAMPLES_PER_SC):
             continue
         err = abs(line_hz / LINE_FREQ_HZ - 1)
         key = (round(err, 9), -spl)
@@ -2843,6 +2848,10 @@ STREAM_RESYNC_S = 0.0              # 0 disables the resync entirely
 # --stream-capture-s: acquisition window. Must exceed one field (16.7 ms) to
 # contain a vertical interval, which is what a rolling picture is about.
 STREAM_CAPTURE_S = 0.040
+# --stream-square N: stream a square wave toggling every N samples instead of
+# video, and measure its half-periods in samples. The only test that can say
+# whether the device delivers our samples faithfully.
+STREAM_SQUARE = 0
 DWF_STATE_NAMES = {DwfStateArmed: "armed", DwfStateDone: "done",
                    DwfStateRunning: "running", DwfStateWait: "wait"}
 
@@ -3450,13 +3459,19 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                         # dt is in MICROSECONDS here (compare_captures
                         # defaults to 0.020 for 50 MS/s), not seconds.
                         dt_us = 1e6 / scope_rate
-                        prof = profile_capture(samples, dt_us)
-                        if prof is None or not prof.get("counts", (0,))[0]:
-                            describe_capture(samples, dt_us)
+                        if STREAM_SQUARE:
+                            square_integrity(samples, dt_us, rate,
+                                             STREAM_SQUARE)
                         else:
-                            show_profile(prof, "streamed output")
-                            check_chain_gain(prof, expect_sync_v)
-                        stream_line_jitter(samples, dt_us, rate, spl_hint)
+                            prof = profile_capture(samples, dt_us)
+                            if (prof is None
+                                    or not prof.get("counts", (0,))[0]):
+                                describe_capture(samples, dt_us)
+                            else:
+                                show_profile(prof, "streamed output")
+                                check_chain_gain(prof, expect_sync_v)
+                            stream_line_jitter(samples, dt_us, rate,
+                                               spl_hint)
                         # Reading a large buffer stalls the loop, so the
                         # clock-paced estimate is stale afterwards. Re-baseline
                         # it to "FIFO full" rather than chasing the deficit.
@@ -3491,6 +3506,86 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                   f"({(actual / rate - 1) * 100:+.3f}%)")
             print(f"  -> line {line_hz:.2f} Hz (NTSC 15734.27), field "
                   f"{line_hz / 262.5:.4f} Hz (NTSC 59.9401)")
+
+
+def make_square_filler(half_n, lo=-0.9, hi=0.9):
+    """A fill_fn producing a square wave toggling every `half_n` samples.
+
+    This is the integrity instrument. DC cannot reveal a dropped or duplicated
+    sample, and video is too complex to attribute a defect to one cause -- but
+    a square wave with a known half-period in SAMPLES turns any sample the
+    device loses or repeats into a measurable change in a half-period, with a
+    position and a size. It answers the one question nothing else has: does
+    PlayData deliver exactly the samples we hand it?
+    """
+    def fill(dst, abs_pos, n):
+        for i in range(n):
+            dst[i] = hi if ((abs_pos + i) // half_n) % 2 == 0 else lo
+    return fill
+
+
+def square_integrity(samples, dt_us, rate, half_n):
+    """Measure a captured square wave's half-periods, in output samples.
+
+    A clean stream gives every half-period as exactly `half_n` samples. Each
+    deviation is a count of samples gained or lost, and the spacing between
+    deviations says whether they follow the chunk size, the sequence, or
+    nothing at all.
+    """
+    srt = sorted(samples)
+    n = len(srt)
+    lo, hi = srt[n // 200], srt[-(n // 200) - 1]
+    if hi - lo < 0.050:
+        print(f"\n  square wave: FLAT ({(hi - lo) * 1000:.1f} mV p-p). "
+              f"Nothing on the input.")
+        return
+    mid = (lo + hi) / 2.0
+    # Sub-sample interpolated crossings, so the measurement is not limited to
+    # the scope's grid.
+    edges = []
+    for i in range(1, len(samples)):
+        a, b = samples[i - 1], samples[i]
+        if (a < mid) != (b < mid):
+            edges.append((i - 1 + (mid - a) / (b - a)) * dt_us)
+    if len(edges) < 20:
+        print(f"\n  square wave: only {len(edges)} edges found; "
+              f"cannot measure.")
+        return
+    want_us = half_n / rate * 1e6
+    halves = [(edges[i + 1] - edges[i]) for i in range(len(edges) - 1)]
+    in_smp = [h * rate / 1e6 for h in halves]
+    srt_s = sorted(in_smp)
+    med = srt_s[len(srt_s) // 2]
+    print(f"\n=== sample-stream integrity ===")
+    print(f"  square wave, half-period {half_n} samples "
+          f"({want_us:.3f} us at {rate / 1e6:.4f} MS/s)")
+    print(f"  {len(edges):,} edges, {len(halves):,} half-periods over "
+          f"{len(samples) * dt_us / 1000:.2f} ms")
+    print(f"  half-period  median {med:.3f} samples (want {half_n}), "
+          f"range {srt_s[0]:.3f}..{srt_s[-1]:.3f}")
+    # A deviation of half a sample or more is a real gained/lost sample.
+    bad = [(i, v) for i, v in enumerate(in_smp) if abs(v - half_n) >= 0.5]
+    if not bad:
+        print(f"  CLEAN: every half-period within 0.5 samples of {half_n}.")
+        print(f"  The device delivers the stream faithfully at this rate.")
+        return
+    net = sum(v - half_n for v in in_smp)
+    print(f"  {len(bad)} of {len(halves)} half-periods off by >= 0.5 samples "
+          f"({len(bad) / len(halves) * 100:.2f}%)")
+    print(f"  net sample error over the capture: {net:+.1f} samples "
+          f"({net / rate * 1e6:+.1f} us)")
+    for i, v in bad[:10]:
+        print(f"    half-period {i:5}  {v:8.3f} samples "
+              f"({v - half_n:+.2f})  at {edges[i] / 1000:.3f} ms")
+    if len(bad) > 1:
+        gaps = [bad[k + 1][0] - bad[k][0] for k in range(len(bad) - 1)]
+        gs = sorted(gaps)
+        smp_between = gs[len(gs) // 2] * half_n
+        print(f"  spacing between defects: median {gs[len(gs) // 2]} "
+              f"half-periods = {smp_between:,} samples, "
+              f"range {gs[0]}..{gs[-1]}")
+        print(f"  (chunk is up to 32,768 samples; one sequence is the "
+              f"frame length)")
 
 
 def make_background_filler(bg, total):
@@ -3571,7 +3666,12 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
     bg, total, amplitude, offset, ball_n, blank_n, fsc = \
         build_motion_background(spl, rate)
     geom = motion_geometry(spl, rate)
-    if STREAM_STATIC:
+    if STREAM_SQUARE:
+        fill_fn = make_square_filler(STREAM_SQUARE)
+        print(f"      --stream-square {STREAM_SQUARE}: square wave, not "
+              f"video. Measures whether the\n      device delivers our "
+              f"samples faithfully; video cannot isolate that.")
+    elif STREAM_STATIC:
         fill_fn = make_background_filler(bg, total)
         print("      --stream-static: no ball. Content is byte-identical to "
               "what --deep plays,\n"
@@ -3616,6 +3716,8 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
         hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(rate / scale)),
         "FrequencySet")
     scale_v = LEVEL * (2.0 if SOURCE_SERIES_75R else 1.0)
+    if STREAM_SQUARE:
+        amplitude, offset = 0.5, 0.0      # +/-0.45 V at the filler's +/-0.9
     check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
         hdwf, ch, AnalogOutNodeCarrier,
         ctypes.c_double(amplitude * scale_v)), "AmplitudeSet")
@@ -4173,7 +4275,8 @@ def main():
             "--burst-start", "--burst-amp", "--copies", "--setup",
             "--bar-amp", "--motion-seconds", "--stream-capture",
             "--stream-func", "--stream-align", "--stream-resync",
-            "--stream-guard", "--stream-capture-s"}
+            "--stream-guard", "--stream-capture-s", "--stream-div",
+            "--stream-square"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -4207,7 +4310,7 @@ def main():
     global RUN_INFINITE, COPIES
     global SOURCE_SERIES_75R, MOTION_SECONDS, STREAM_RATE_CHECK
     global STREAM_CAPTURE_AT, STREAM_FUNC, STREAM_STATIC, STREAM_ALIGN
-    global STREAM_RESYNC_S, STREAM_GUARD, STREAM_CAPTURE_S
+    global STREAM_RESYNC_S, STREAM_GUARD, STREAM_CAPTURE_S, STREAM_SQUARE
     # --locked: the combination measured to lock a Leader LV5700A through a
     # vectorscope-and-monitor chain. Individual flags still override it.
     if "--locked" in argv:
@@ -4231,6 +4334,7 @@ def main():
     STREAM_RESYNC_S = opt("--stream-resync", float, STREAM_RESYNC_S)
     STREAM_GUARD = max(0, opt("--stream-guard", int, STREAM_GUARD))
     STREAM_CAPTURE_S = opt("--stream-capture-s", float, STREAM_CAPTURE_S)
+    STREAM_SQUARE = max(0, opt("--stream-square", int, 0))
     STREAM_FUNC = opt("--stream-func", str, STREAM_FUNC)
     if STREAM_FUNC not in ("play", "pattern"):
         raise RuntimeError("--stream-func must be 'play' or 'pattern'.")
@@ -4357,7 +4461,8 @@ def main():
                 capture(dwf, hdwf, 25e6, 1 << 16)      # discard: settling
                 scale = calibrate_play_rate(dwf, hdwf, ch, fn)
             div, spl, rate, line_hz = choose_stream_timing(
-                100e6, colour="--color" in argv)
+                100e6, colour="--color" in argv,
+                force_div=opt("--stream-div", int, None))
             print(f"Deep-memory playback: {frame_lines()}-line "
                   f"{'interlaced' if INTERLACED else 'progressive'}, "
                   f"func {fn.value}, rate scale {scale:.4f}x")
