@@ -3962,6 +3962,10 @@ def feed_tune(dwf, secs=1.2):
         # the margin is what decides whether occasional host hiccups turn into
         # dropouts.
         targets = (1e6, 5e6, 11e6, 100e6 / 7, 16e6, 20e6, 25e6, 30e6)
+        print("\n  Throughput only -- DC cannot reveal dropped samples, and "
+              "the counters\n  read 0 on a stream that was measurably "
+              "corrupted. Integrity needs\n  --stream-capture on the real "
+              "waveform.")
         print(f"\n  {'loop':6} {'target':>9} {'achieved':>9} {'lost':>8} "
               f"{'corrupt':>8} {'CH1':>7} {'depth':>8}  verdict")
         best = {}
@@ -3973,7 +3977,13 @@ def feed_tune(dwf, secs=1.2):
                       and ms >= tg / 1e6 * 0.95)
                 if ok:
                     best[kind] = max(best.get(kind, 0.0), tg / 1e6)
-                verdict = err or ("clean" if ok else "underruns")
+                # "meets rate", NOT "clean": this streams DC, and a dropped
+                # or duplicated DC sample is indistinguishable from a kept
+                # one. lost and corrupt both read 0 on a stream that a direct
+                # capture showed had 179 us of jitter and 28 bad lines in 607.
+                # So this measures THROUGHPUT only. Signal integrity has to be
+                # measured on the real waveform, with --stream-capture.
+                verdict = err or ("meets rate" if ok else "short")
                 print(f"  {kind:6} {tg / 1e6:9.3f} {ms:9.3f} {lo:>8,} "
                       f"{co:>8,} {v:+7.3f} {depth:>8,}  {verdict}")
         print()
