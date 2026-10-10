@@ -3615,16 +3615,43 @@ def square_integrity(samples, dt_us, rate, half_n):
               f"Nothing on the input.")
         return
     mid = (lo + hi) / 2.0
-    # Sub-sample interpolated crossings, so the measurement is not limited to
-    # the scope's grid.
+    # Schmitt trigger, not a bare mid-crossing. A naive detector counted
+    # 181,055 edges on a capture that held about 5,715, because every
+    # transition and any noise near mid produced a cluster of crossings. An
+    # edge is only accepted once the signal has reached a quarter of the way
+    # to the far rail, and its time is taken from the mid crossing.
+    hi_th = mid + 0.25 * (hi - mid)
+    lo_th = mid - 0.25 * (mid - lo)
     edges = []
+    state = 1 if samples[0] > mid else -1
     for i in range(1, len(samples)):
-        a, b = samples[i - 1], samples[i]
-        if (a < mid) != (b < mid):
-            edges.append((i - 1 + (mid - a) / (b - a)) * dt_us)
+        v = samples[i]
+        if state < 0 and v > hi_th:
+            j = i
+            while j > 0 and samples[j - 1] > mid:
+                j -= 1
+            a, b = samples[j - 1], samples[j]
+            if b != a:
+                edges.append((j - 1 + (mid - a) / (b - a)) * dt_us)
+            state = 1
+        elif state > 0 and v < lo_th:
+            j = i
+            while j > 0 and samples[j - 1] < mid:
+                j -= 1
+            a, b = samples[j - 1], samples[j]
+            if b != a:
+                edges.append((j - 1 + (mid - a) / (b - a)) * dt_us)
+            state = -1
+    want_edges = len(samples) * dt_us / (half_n / rate * 1e6)
     if len(edges) < 20:
         print(f"\n  square wave: only {len(edges)} edges found; "
               f"cannot measure.")
+        return
+    if len(edges) > 3 * want_edges:
+        print(f"\n  square wave: {len(edges):,} edges where about "
+              f"{want_edges:,.0f} are expected -- the capture is not a clean "
+              f"square wave, so these statistics would be meaningless.")
+        describe_capture(samples, dt_us)
         return
     want_us = half_n / rate * 1e6
     halves = [(edges[i + 1] - edges[i]) for i in range(len(edges) - 1)]
