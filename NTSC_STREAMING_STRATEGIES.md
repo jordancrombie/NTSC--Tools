@@ -254,3 +254,38 @@ ball position is a function of absolute sample index and nothing repeats.
 Deliberately **not** doing: phase-timed applies in the first version, and any
 `PlayData` fallback. One variable at a time, and validate the instrument before
 the subject — both lessons this project paid for repeatedly.
+
+
+---
+
+# Result
+
+Built as `--motion --dual`. Validated with the square wave **before** judging
+the picture, because the apply validation had used a bounded run while this
+path uses `RunSet(0.0)`:
+
+| | |
+|---|---|
+| half-periods | 14,284 |
+| defects | **0 — CLEAN**, median 100.000, range 99.997..100.003 |
+| applies at the time of capture | 3, with run 0 |
+
+Sustained behaviour, video content:
+
+| | |
+|---|---|
+| buffer | 3,813,600 samples (4 sequences), 267 ms playout, 30.5 MB |
+| generation | 2 ms (0.9% of playout) |
+| upload | 45 ms at 677 MB/s (17% of playout) |
+| worst apply | 65 ms of the 267 ms budget — 24% |
+| applies | 91 in 24 s, **0 refused** |
+| unique content | 347 M samples in 24 s, nothing repeating |
+
+So the throughput question is comfortably answered: 24% of the budget used,
+and `DataSet` runs at 677 MB/s against the 114 MB/s the colour rate needs.
+
+What remains to judge is the picture, specifically the ball position at a
+swap seam. Sync structure is identical across passes so timing cannot be
+disturbed, but the ball can jump by up to one buffer period of travel — about
+11% of screen width at four sequences. If that is visible, the fix is
+phase-timed applies, which is a refinement rather than a rewrite.

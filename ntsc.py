@@ -3331,6 +3331,155 @@ def square_deep_control(dwf, hdwf, ch, rate, scale, half_n,
     return 0
 
 
+# --dual: unbounded motion by swapping a deep-memory buffer with
+# Configure(ch, 3). DUAL_SEQ is how many four-field sequences one buffer
+# holds; the buffer must clear 2,000,000 samples or DataSet silently no-ops
+# and the channel keeps playing stale deep-memory content.
+DUAL_SEQ = 4
+
+
+def start_motion_dual(dwf, hdwf, ch, spl, rate, scale):
+    """Unbounded motion from deep memory, no PlayData anywhere.
+
+    One buffer of DUAL_SEQ whole four-field sequences loops in hardware. While
+    pass k plays, pass k+1 is generated into the host buffer and handed over
+    with NodeDataSet + Configure(ch, 3), which was measured to swap a running
+    funcPlay buffer with zero defects -- against 0.63% of half-periods
+    defective for streamed PlayData.
+
+    The swap takes effect immediately rather than at a buffer wrap. That is
+    accepted deliberately: every pass carries identical sync structure and
+    differs only in the ball's position, so a mid-buffer swap cannot disturb
+    sync timing at all. The worst case is the ball jumping by up to one buffer
+    period of travel.
+    """
+    bg, total, amplitude, offset, ball_n, blank_n, fsc = \
+        build_motion_background(spl, rate)
+    geom = motion_geometry(spl, rate)
+    if STREAM_SQUARE:
+        inner = make_square_filler(STREAM_SQUARE)
+        amplitude, offset = 0.5, 0.0
+        print(f"      --stream-square {STREAM_SQUARE}: square wave, not "
+              f"video, so the applies can be\n      checked against the "
+              f"half-period rather than judged by eye")
+    else:
+        inner = make_motion_filler(bg, total, geom, ball_n, blank_n, rate)
+
+    n = DUAL_SEQ * total
+    if n < 2_000_000:
+        raise RuntimeError(
+            f"--dual-seq {DUAL_SEQ} gives {n:,} samples, below the 2,000,000 "
+            f"at which DataSet was measured to take effect. Below that it "
+            f"returns success and the channel keeps playing stale content. "
+            f"Use --dual-seq {-(-2_000_000 // total)} or more.")
+    buf = (ctypes.c_double * n)()
+    t = time.time()
+    inner(buf, 0, n)
+    gen = time.time() - t
+    period = n / rate
+    print(f"      --dual: {DUAL_SEQ} sequences per buffer = {n:,} samples, "
+          f"{period * 1000:.1f} ms playout, {n * 8 / 1e6:.1f} MB")
+    print(f"      generating one buffer costs {gen * 1000:.0f} ms "
+          f"({gen / period * 100:.1f}% of its playout)")
+
+    check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
+    dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+    check(dwf, dwf.FDwfAnalogOutNodeEnableSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_int(1)), "NodeEnableSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(
+        hdwf, ch, AnalogOutNodeCarrier, funcPlay), "NodeFunctionSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(rate / scale)),
+        "FrequencySet")
+    scale_v = LEVEL * (2.0 if SOURCE_SERIES_75R else 1.0)
+    check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
+        hdwf, ch, AnalogOutNodeCarrier,
+        ctypes.c_double(amplitude * scale_v)), "AmplitudeSet")
+    check(dwf, dwf.FDwfAnalogOutNodeOffsetSet(
+        hdwf, ch, AnalogOutNodeCarrier,
+        ctypes.c_double(offset * scale_v)), "OffsetSet")
+    t = time.time()
+    check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+        hdwf, ch, AnalogOutNodeCarrier, buf, ctypes.c_int(n)), "DataSet")
+    up = time.time() - t
+    # RunSet(0.0) with RepeatSet(0) is what --motion uses for a byte-perfect
+    # picture, and avoids the ~24-sample re-arm gap a bounded repeated run
+    # costs at every boundary. The apply validation used a BOUNDED run, so
+    # --stream-square here is what confirms applies are still clean with 0.
+    check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(0.0)),
+          "RunSet")
+    check(dwf, dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(0)),
+          "RepeatSet")
+    check(dwf, dwf.FDwfAnalogOutWaitSet(hdwf, ch, ctypes.c_double(0.0)),
+          "WaitSet")
+    check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
+          "Configure(start)")
+    report_output_window(dwf, hdwf, ch, amplitude * scale_v, offset * scale_v)
+    print(f"      upload {up * 1000:.0f} ms ({n * 8 / up / 1e6:.0f} MB/s); "
+          f"budget per pass is {period * 1000:.0f} ms")
+    print("\nUnbounded motion by buffer swap. Press Ctrl+C to stop.")
+
+    sts = ctypes.c_ubyte()
+    k = 0
+    applies = refused = 0
+    worst = 0.0
+    t0 = last = time.time()
+    nxt = period
+    validated = not (STREAM_SQUARE and STREAM_CAPTURE_AT is not None)
+    try:
+        while True:
+            now = time.time() - t0
+            if now >= nxt:
+                k += 1
+                t = time.time()
+                inner(buf, k * n, n)
+                check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+                    hdwf, ch, AnalogOutNodeCarrier, buf, ctypes.c_int(n)),
+                    "DataSet(apply)")
+                if dwf.FDwfAnalogOutConfigure(hdwf, ch,
+                                              ctypes.c_int(3)) == 1:
+                    applies += 1
+                else:
+                    refused += 1
+                    print(f"  apply refused at pass {k}: {last_error(dwf)}")
+                dt = time.time() - t
+                worst = max(worst, dt)
+                nxt = max(now + 0.001, nxt + period)
+            check(dwf, dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts)),
+                  "AnalogOutStatus")
+            if sts.value != DwfStateRunning:
+                raise RuntimeError(
+                    f"AWG left the running state: "
+                    f"{DWF_STATE_NAMES.get(sts.value, sts.value)}")
+            if not validated and now > 3 * period:
+                validated = True
+                setup_scope(dwf, hdwf)
+                capture(dwf, hdwf, 25e6, 1 << 16)      # discard: settling
+                cn = int(STREAM_CAPTURE_S * 50e6)
+                s = capture(dwf, hdwf, 50e6, cn)
+                if SAVE_CAPTURE:
+                    with open(SAVE_CAPTURE, "w") as f:
+                        for i, v in enumerate(s):
+                            f.write(f"{i / 50e6:.9f},{v:.6f}\n")
+                    print(f"  wrote {SAVE_CAPTURE}")
+                square_integrity(s, 1e6 / 50e6, rate, STREAM_SQUARE)
+                print(f"  (with {applies} applies issued so far, run 0)")
+                t0 = time.time() - now        # keep the pass cadence
+            if time.time() - last >= 5.0:
+                last = time.time()
+                el = time.time() - t0
+                print(f"  {el:6.1f} s  pass {k:,}  applies {applies:,}  "
+                      f"refused {refused}  worst apply {worst * 1000:.0f} ms "
+                      f"of {period * 1000:.0f} ms")
+    except KeyboardInterrupt:
+        el = time.time() - t0
+        print(f"\nStopped after {el:.1f} s: {k:,} passes, "
+              f"{applies:,} applies, {refused} refused, worst apply "
+              f"{worst * 1000:.0f} ms, {k * n / 1e6:.0f} M samples of "
+              f"unique content")
+    return n
+
+
 def start_motion(dwf, hdwf, ch, spl, rate, scale):
     """A bouncing ball looped out of deep memory -- no host feed at all.
 
@@ -4972,7 +5121,7 @@ def main():
              "--play-info", "--play-test", "--play-configs", "--pattern-info",
              "--clock-info", "--stream-probe", "--feed-matrix",
              "--feed-tune", "--transport", "--memory-probe",
-             "--dual-probe", "--dual-sacrificial",
+             "--dual-probe", "--dual-sacrificial", "--dual",
              # A/B switches for things that were tested and are documented
              "--no-filter", "--sync-tip-zero", "--vbi-black",
              "--no-loop-align", "--fsc-nominal"}
@@ -4984,7 +5133,7 @@ def main():
             "--stream-func", "--stream-align", "--stream-resync",
             "--stream-guard", "--stream-capture-s", "--stream-div",
             "--stream-square", "--stream-pad", "--stream-pad-every",
-            "--dual-buffer", "--dual-hz", "--dual-change"}
+            "--dual-buffer", "--dual-hz", "--dual-change", "--dual-seq"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -5019,7 +5168,7 @@ def main():
     global SOURCE_SERIES_75R, MOTION_SECONDS, STREAM_RATE_CHECK
     global STREAM_CAPTURE_AT, STREAM_FUNC, STREAM_STATIC, STREAM_ALIGN
     global STREAM_RESYNC_S, STREAM_GUARD, STREAM_CAPTURE_S, STREAM_SQUARE
-    global STREAM_DOC, STREAM_PAD, STREAM_PAD_EVERY
+    global STREAM_DOC, STREAM_PAD, STREAM_PAD_EVERY, DUAL_SEQ
     # --locked: the combination measured to lock a Leader LV5700A through a
     # vectorscope-and-monitor chain. Individual flags still override it.
     if "--locked" in argv:
@@ -5045,6 +5194,7 @@ def main():
     STREAM_CAPTURE_S = opt("--stream-capture-s", float, STREAM_CAPTURE_S)
     STREAM_SQUARE = max(0, opt("--stream-square", int, 0))
     STREAM_DOC = "--stream-doc" in argv
+    DUAL_SEQ = max(1, opt("--dual-seq", int, DUAL_SEQ))
     STREAM_PAD = max(0, opt("--stream-pad", int, 0))
     STREAM_PAD_EVERY = max(1, opt("--stream-pad-every", int,
                                   STREAM_PAD_EVERY))
@@ -5200,6 +5350,10 @@ def main():
                     sacrificial="--dual-sacrificial" in argv,
                     path=SAVE_CAPTURE,
                     change_to=opt("--dual-change", int, 0))
+                return
+
+            if "--motion" in argv and "--dual" in argv:
+                start_motion_dual(dwf, hdwf, ch, spl, rate, scale)
                 return
 
             if "--motion" in argv:
