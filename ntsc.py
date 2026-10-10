@@ -2810,8 +2810,15 @@ STREAM_ALIGN = 1
 #             optimistic estimate still cannot overfill.
 #   RESYNC_S  how often to pay 1792 us for a TRUE `free`, then refill by
 #             exactly that much and reset the estimate.
-STREAM_GUARD = 16384
-STREAM_RESYNC_S = 1.0
+# Both default OFF. They were added on a theory that the feed was overfeeding
+# into a full FIFO, and the measurement refuted it: with GUARD 16384 and a 1 s
+# resync the drift came back at -200 ms (starving, not overfeeding) and lost
+# went from 0 to 7.7 billion. Halving the target fill halves the samples per
+# PlayData call, and throughput per iteration is call-bound, so the guard
+# simply starved the device. Without them the feed is clean -- 14.29 MS/s,
+# lost 0, corrupt 0, for 26 s. Kept as knobs, not as defaults.
+STREAM_GUARD = 0
+STREAM_RESYNC_S = 0.0              # 0 disables the resync entirely
 DWF_STATE_NAMES = {DwfStateArmed: "armed", DwfStateDone: "done",
                    DwfStateRunning: "running", DwfStateWait: "wait"}
 
@@ -3215,7 +3222,7 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
     free, lost, corrupt = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
     sts = ctypes.c_ubyte()
     t_poll = 0.0
-    t_resync = STREAM_RESYNC_S
+    t_resync = STREAM_RESYNC_S if STREAM_RESYNC_S > 0 else float("inf")
     resyncs = 0
     drift_sum = 0.0
     t_rep = report
@@ -3245,7 +3252,8 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
             # that much -- the only write size we can be certain of -- and
             # reset the estimate to "full". Costs 1792 us, during which a full
             # FIFO drains to about 0.5 ms, so it must not run often.
-            if cap_state != "armed" and now >= t_resync:
+            if (STREAM_RESYNC_S > 0 and cap_state != "armed"
+                    and now >= t_resync):
                 check(dwf, dwf.FDwfAnalogOutStatus(hdwf, ch,
                                                    ctypes.byref(sts)),
                       "AnalogOutStatus")
@@ -4088,7 +4096,8 @@ def main():
             "--sys-clock", "--capture", "--seconds", "--level",
             "--burst-start", "--burst-amp", "--copies", "--setup",
             "--bar-amp", "--motion-seconds", "--stream-capture",
-            "--stream-func", "--stream-align", "--stream-resync"}
+            "--stream-func", "--stream-align", "--stream-resync",
+            "--stream-guard"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -4122,7 +4131,7 @@ def main():
     global RUN_INFINITE, COPIES
     global SOURCE_SERIES_75R, MOTION_SECONDS, STREAM_RATE_CHECK
     global STREAM_CAPTURE_AT, STREAM_FUNC, STREAM_STATIC, STREAM_ALIGN
-    global STREAM_RESYNC_S
+    global STREAM_RESYNC_S, STREAM_GUARD
     # --locked: the combination measured to lock a Leader LV5700A through a
     # vectorscope-and-monitor chain. Individual flags still override it.
     if "--locked" in argv:
@@ -4143,7 +4152,8 @@ def main():
     STREAM_CAPTURE_AT = opt("--stream-capture", float, None)
     STREAM_STATIC = "--stream-static" in argv
     STREAM_ALIGN = max(1, opt("--stream-align", int, 1))
-    STREAM_RESYNC_S = max(0.05, opt("--stream-resync", float, STREAM_RESYNC_S))
+    STREAM_RESYNC_S = opt("--stream-resync", float, STREAM_RESYNC_S)
+    STREAM_GUARD = max(0, opt("--stream-guard", int, STREAM_GUARD))
     STREAM_FUNC = opt("--stream-func", str, STREAM_FUNC)
     if STREAM_FUNC not in ("play", "pattern"):
         raise RuntimeError("--stream-func must be 'play' or 'pattern'.")
