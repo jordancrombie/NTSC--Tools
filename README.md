@@ -236,6 +236,137 @@ assume.
 - Saturated red and blue on 75% bars legally reach **−16 IRE**, so a sync
   slicer set at −12 IRE will false-trigger on chroma.
 
+## Command reference
+
+Every flag and option, grouped by purpose. `--help` prints the bare lists;
+this explains them.
+
+### Choosing what to generate
+
+| | |
+|---|---|
+| `--color` | 75% EIA colour bars with burst and chroma. Needs `--deep` or `--stream`; without it the output is monochrome bars |
+| `--pattern bars8` | eight alternating white/black bars (default) |
+| `--pattern gray8` | an eight-step grey staircase |
+| `--pattern white` | flat 100.00 IRE field, no chroma — the signal to calibrate output level against |
+| `--bar-amp PCT` | colour-bar amplitude, default 75. `100` gives full-amplitude bars, whose chroma peaks near 134 IRE and may clip some inputs |
+| `--progressive` | 262-line progressive instead of 525 interlaced. Not standards-valid, but it closes in a single frame |
+| `--lines N` | total lines per frame, default 525 |
+| `--spl N` | force samples per line instead of letting the divider search choose |
+
+### Levels
+
+| | |
+|---|---|
+| `--level X` | output scale. `1.0` is a nominal 1 V p-p; `--locked` sets 0.9 |
+| `--setup IRE` | setup pedestal, default 7.5 (NTSC-M). `0` gives zero setup (NTSC-J), where black and blanking coincide |
+| `--series-75` | declare a 75 Ω resistor in series with W1, doubling the drive so a matched load sees the right level. **Verify with `--pattern white`** — the ×2 assumes exactly one 75 Ω termination in the chain |
+| `--sat X` | chroma saturation multiplier, default 1.0 |
+| `--burst-amp IRE` | colour burst amplitude, peak to peak. Spec is 40 |
+| `--burst-start US` | burst start measured from the sync edge, default 5.3, giving a 0.6 µs breezeway |
+| `--sync-tip-zero` | put the sync tip at 0 V rather than blanking at 0 V. Non-compliant for a DC-coupled instrument; retained because it was the original behaviour |
+| `--vbi-black` | vertical-interval lines at black rather than blanking. Blanking is correct; this restores the earlier behaviour |
+| `--no-filter` | skip the 4.2 MHz luma and 1.3 MHz chroma band-limiting |
+
+### Output path
+
+| | |
+|---|---|
+| *(default)* | `funcCustom` loops a 32 Ki buffer in hardware. Rock solid, but caps samples per line at 54 |
+| `--deep` | preload the whole sequence into play memory and loop it in hardware. The path that produces a correct picture |
+| `--stream` | feed chunks with `PlayData`. Measured about 5.8 MS/s sustained; superseded |
+| `--locked` | the preset measured to lock a Leader LV5700A: `--level 0.9 --burst-amp 41 --run-infinite` |
+| `--run-infinite` | an unbounded run rather than a repeated fixed-length one, avoiding roughly 24 samples of re-arm at every boundary |
+| `--play-scale X` | the requested-to-actual play rate factor. `1.0` is correct on this device and skips scope calibration |
+| `--config N` | force a device configuration instead of choosing one |
+| `--copies N` | load N back-to-back copies of the sequence so per-run overhead is paid less often. 7.6 MB each |
+| `--max-res` | prefer line-rate accuracy over sync-pulse-width accuracy. Off by default, because a sync separator discriminates pulses by width |
+| `--fsc-nominal` | generate the subcarrier at exactly 3.579545 MHz instead of locking it to 227.5 × the real line rate. Trades a 250 Hz offset for a walking SCH phase |
+| `--sys-clock HZ` | request a different system clock. 100,227,273 Hz would make divider 7 give exactly 4fsc — **accepted by the API but never verified on hardware** |
+| `--no-loop-align` | do not rotate the sequence so its loop point falls in blanked vertical interval |
+
+### Motion
+
+| | |
+|---|---|
+| `--motion` | bouncing ball over the bars, looped from deep memory. Seamless and hardware-timed, capped at 9.34 s |
+| `--motion-seconds S` | loop length. Longer buys slower, more natural motion at the cost of host RAM: 1.0 s needs 114 MB, 9.4 s needs 1068 MB |
+| `--dual` | **unbounded** motion: swap the buffer while it plays using `Configure(ch, 3)`. No `PlayData`, so none of the sample loss streaming suffers |
+| `--dual-seq N` | four-field sequences per buffer, default 4 (267 ms). Refuses below 2,000,000 samples, where `DataSet` silently does nothing |
+| `--motion-stream` | feed motion with `PlayData` instead. Works mechanically but carries the device's sample loss — see Status |
+
+### Measurement
+
+| | |
+|---|---|
+| `--dump` | build and validate a frame offline and write `ntsc_frame.csv`. Needs no hardware |
+| `--analyze` | conformance report on CH1: levels, sync depth, pulse widths, burst placement, fsc/fH lock |
+| `--scan` | per-line metrics across several sequences, reporting *where* anomalies fall and whether they repeat |
+| `--verify` | pulse widths, line period and jitter measured from the real output |
+| `--capture PATH` | capture CH1 with nothing generating, for profiling a reference generator |
+| `--seconds S` | capture length for `--capture` |
+| `--save-capture PATH` | write the capture as CSV |
+| `--compare A B` | diff two captures parameter by parameter. The most useful tool in the project |
+| `--stream-capture S` | capture our own output S seconds into a stream, interleaved so the feed keeps running |
+| `--stream-capture-s S` | that capture's length, default 0.040. Must exceed one field to contain a vertical interval |
+| `--stream-square N` | stream a square wave of half-period N samples instead of video and measure the half-periods back. **The only instrument that can validate a stream** — DC cannot reveal a dropped sample |
+
+### Device diagnostics
+
+| | |
+|---|---|
+| `--transport` | per-call round-trip costs. `AnalogOutStatus` is 1393 µs and the only real device round trip; `PlayStatus` at 0.7 µs is a local read of what it cached |
+| `--feed-matrix` | configuration × streaming-recipe table, with a capture of each. How "only play-memory-0 configurations emit `PlayData`" was established |
+| `--feed-tune` | maximum sustainable feed rate per loop structure. Throughput only — it cannot see corruption |
+| `--memory-probe` | whether `analogout-memory:#` deepens the FIFO. It does not: fixed at 32,768 from 16 to 512 MiB |
+| `--dual-probe` | whether `Configure(ch, 3)` swaps a running buffer seamlessly. Re-applies identical data, so any defect is the apply's fault |
+| `--dual-buffer N` | that probe's buffer size in samples |
+| `--dual-hz H` | that probe's apply rate |
+| `--dual-change N` | apply a different half-period, to locate in time when an apply actually lands |
+| `--clock-info` | whether the reference clock can be changed. Exact NTSC timing needs it |
+| `--pattern-info` | how many samples each output function accepts, per configuration |
+| `--play-info` | report AWG streaming capability |
+| `--play-configs` | try both streaming functions in every device configuration |
+| `--play-test` | minimal `funcPlay` check: stream a ramp and see whether anything reaches W1 |
+| `--stream-probe` | older `PlayData` throughput sweep, superseded by `--feed-tune` |
+
+### Experiments kept as documented dead ends
+
+All default off, and kept so the experiments are not repeated by accident.
+Each either made things worse or changed nothing; the reasoning is in
+`NTSC_FINDINGS.md`.
+
+| | |
+|---|---|
+| `--stream-pad N` | insert N padding samples to pre-compensate the FIFO wrap loss. Identical net loss: the drop is phase-locked to a ring address the host cannot reach |
+| `--stream-pad-every M` | the padding interval |
+| `--stream-guard N` | hold N samples of FIFO headroom. Shrinks the chunk and starves the feed |
+| `--stream-resync S` | periodically read a true `free` with `AnalogOutStatus`. Costs 78% of the FIFO budget |
+| `--stream-align N` | quantise every write to a multiple of N samples. No effect on the loss |
+| `--stream-static` | stream the bars with no ball, to hold content constant while delivery varies |
+| `--stream-doc` | the SDK's documented three-call feed loop. Correct, and clean only to about 2 MS/s here |
+| `--stream-func` | pick between the two shipped streaming recipes, `play` or `pattern`. Both behave identically |
+| `--stream-div N` | force the clock divider for streaming |
+| `--stream-rate HZ` | cap the divider search, default 15 MS/s |
+| `--stream-rate-check` | measure the device's real consumption rate. Underruns while it runs |
+| `--dual-sacrificial` | the AD3 sacrificial-apply workaround. **Harmful here** — five defects against zero |
+
+### Internals
+
+For reading the source rather than driving the CLI:
+
+| | |
+|---|---|
+| `build_frame_volts`, `build_interlaced_volts` | monochrome frame construction, laid out in half-lines |
+| `build_colour_volts` | the colour path: luma and chroma envelopes, burst, band-limiting, four-field subcarrier closure |
+| `motion_geometry`, `ball_runs` | where every active picture line starts, and which samples the ball covers |
+| `make_motion_filler` | `fill_fn(dst, abs_pos, n)` — generates any window of the signal on demand. The interface every output path consumes |
+| `start_awg`, `start_deep`, `start_motion`, `start_motion_dual`, `start_motion_stream` | the output paths |
+| `stream_feed`, `stream_chunk`, `feed_amount` | the `PlayData` feed loop and its pure sizing helpers |
+| `square_integrity`, `square_deep_control` | sample-stream integrity measurement and its hardware control |
+| `profile_capture`, `show_profile`, `compare_captures` | capture profiling and reference diffing |
+| `report_output_window`, `check_chain_gain` | guards that catch a clamped output window, and an active device sitting in the capture path |
+
 ## Repository
 
 | file | |
