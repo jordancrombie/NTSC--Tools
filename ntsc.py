@@ -3002,6 +3002,67 @@ def motion_loop_plan(rate, seq_samples, seconds, cap):
     return n, loop_t, 2.0 * cyc_x / loop_t, 2.0 * cyc_y / loop_t, cyc_x, cyc_y
 
 
+def square_deep_control(dwf, hdwf, ch, rate, scale, half_n,
+                        capture_s=0.040, scope_rate=50e6, path=None):
+    """Play the square wave from DEEP MEMORY and measure it the same way.
+
+    This is the control for --stream-square, and it should have come first.
+    Deep memory plays a byte-perfect picture with no host involvement, so if
+    the same integrity test reports the same 32-sample defects here, the
+    defects are in the CAPTURE path -- the scope acquiring 100 MB/s while the
+    AWG runs -- and not in streaming at all. If this comes back clean, the
+    streaming defects are real.
+    """
+    period = 2 * half_n
+    n = (1 << 20) // period * period          # whole periods: seamless loop
+    print(f"\nDeep-memory control: square wave, half-period {half_n} samples, "
+          f"{n:,} samples = {n // period:,} whole periods")
+    buf = (ctypes.c_double * n)()
+    make_square_filler(half_n)(buf, 0, n)
+
+    check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
+    dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+    check(dwf, dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_int(1)), "NodeEnableSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier,
+                                                funcPlay), "NodeFunctionSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(rate / scale)),
+        "FrequencySet")
+    check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(0.5)), "AmplitudeSet")
+    check(dwf, dwf.FDwfAnalogOutNodeOffsetSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(0.0)), "OffsetSet")
+    check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+        hdwf, ch, AnalogOutNodeCarrier, buf, ctypes.c_int(n)), "DataSet")
+    # Exactly how --deep loops a perfect picture: whole buffer, run 0,
+    # repeat 0, no host feed at all.
+    check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(0.0)),
+          "RunSet")
+    check(dwf, dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(0)),
+          "RepeatSet")
+    check(dwf, dwf.FDwfAnalogOutWaitSet(hdwf, ch, ctypes.c_double(0.0)),
+          "WaitSet")
+    check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
+          "Configure")
+    report_output_window(dwf, hdwf, ch, 0.5, 0.0)
+
+    setup_scope(dwf, hdwf)
+    capture(dwf, hdwf, 25e6, 1 << 16)                 # discard: settling
+    time.sleep(0.2)
+    samples = capture(dwf, hdwf, scope_rate, int(capture_s * scope_rate))
+    if path:
+        with open(path, "w") as f:
+            for i, v in enumerate(samples):
+                f.write(f"{i / scope_rate:.9f},{v:.6f}\n")
+        print(f"  wrote {path}")
+    square_integrity(samples, 1e6 / scope_rate, rate, half_n)
+    print("\n  If this shows the same 32-sample defects as --motion-stream,")
+    print("  they are in the CAPTURE path, not in streaming: deep memory")
+    print("  needs no host feed and plays a perfect picture.")
+    return n
+
+
 def start_motion(dwf, hdwf, ch, spl, rate, scale):
     """A bouncing ball looped out of deep memory -- no host feed at all.
 
@@ -4492,6 +4553,10 @@ def main():
             print(f"      100 MHz/{div} exactly, line {line_hz:.2f} Hz "
                   f"({(line_hz / LINE_FREQ_HZ - 1) * 100:+.4f}%)")
             if "--motion" in argv:
+                if STREAM_SQUARE and "--motion-stream" not in argv:
+                    square_deep_control(dwf, hdwf, ch, rate, scale,
+                                        STREAM_SQUARE, path=SAVE_CAPTURE)
+                    return
                 if "--motion-stream" in argv:
                     start_motion_stream(dwf, hdwf, ch, spl, rate, scale)
                 else:
