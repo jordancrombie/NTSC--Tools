@@ -2853,6 +2853,15 @@ STREAM_CAPTURE_S = 0.040
 # video, and measure its half-periods in samples. The only test that can say
 # whether the device delivers our samples faithfully.
 STREAM_SQUARE = 0
+# --stream-doc: the SDK's documented feed loop verbatim -- AnalogOutStatus,
+# then PlayStatus, then PlayData of exactly `free` -- with no clock pacing.
+# Measured cost per pass is 2470 us (1393 for AnalogOutStatus, 1077 for
+# PlayData, which is FLAT regardless of size), so it only fits where the FIFO
+# holds more than that: 12.5 MS/s and below. At 14.286 the FIFO is 2294 us and
+# the loop structurally cannot keep up -- that is the real reason the colour
+# rate fails. Below the ceiling `free` is always valid, so there is no
+# estimate to drift and nothing to overfeed.
+STREAM_DOC = False
 DWF_STATE_NAMES = {DwfStateArmed: "armed", DwfStateDone: "done",
                    DwfStateRunning: "running", DwfStateWait: "wait"}
 
@@ -3383,6 +3392,33 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
             if now > 0.25:
                 worst_fill = min(worst_fill, fill)
 
+            if STREAM_DOC and cap_state != "armed":
+                # The manual's loop, exactly: read device state, ask how much
+                # room there is, send that much. No estimate anywhere.
+                check(dwf, dwf.FDwfAnalogOutStatus(hdwf, ch,
+                                                   ctypes.byref(sts)),
+                      "AnalogOutStatus")
+                check(dwf, dwf.FDwfAnalogOutNodePlayStatus(
+                    hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(free),
+                    ctypes.byref(lost), ctypes.byref(corrupt)), "PlayStatus")
+                t_lost += lost.value
+                t_corr += corrupt.value
+                n = min(max(0, free.value), fifo)
+                if STREAM_ALIGN > 1:
+                    n -= n % STREAM_ALIGN
+                if n > 0:
+                    fill_fn(staging, abs_pos, n)
+                    check(dwf, dwf.FDwfAnalogOutNodePlayData(
+                        hdwf, ch, AnalogOutNodeCarrier, staging,
+                        ctypes.c_int(n)), "PlayData")
+                    fed += n
+                    abs_pos += n
+                if now >= t_rep:
+                    print(f"  {now:6.1f} s  fed {fed / now / 1e6:6.3f} MS/s "
+                          f"(need {rate / 1e6:.3f})  free {free.value:>7,}  "
+                          f"lost {t_lost:,}  corrupt {t_corr:,}")
+                    t_rep = now + report
+
             # Closed-loop resync. Read the TRUE free space, refill by exactly
             # that much -- the only write size we can be certain of -- and
             # reset the estimate to "full". Costs 1792 us, during which a full
@@ -3414,7 +3450,8 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                 t_resync = now + STREAM_RESYNC_S
 
             target = max(1, fifo - STREAM_GUARD)
-            n = stream_chunk(target, fill, fifo, STREAM_ALIGN)
+            n = (0 if STREAM_DOC
+                 else stream_chunk(target, fill, fifo, STREAM_ALIGN))
             if n > 0:
                 fill_fn(staging, abs_pos, n)
                 if dwf.FDwfAnalogOutNodePlayData(
@@ -3997,6 +4034,102 @@ enumfilterUSB = ctypes.c_int(1)
 enumfilterNetwork = ctypes.c_int(2)
 
 
+def memory_probe(dwf):
+    """Can analogout-memory deepen the streaming FIFO past 32,768 samples?
+
+    The measurements leave a closed trap. PlayData costs a flat ~1077 us
+    whatever its size, and a trustworthy `free` needs AnalogOutStatus at
+    ~1393 us, so the documented loop takes ~2470 us per pass while the FIFO
+    holds only 2294 us of samples at the colour rate. The buffer empties
+    before the next refill can arrive, which caps the documented loop at
+    13.3 MS/s. Dropping AnalogOutStatus fits the loop but leaves `free`
+    permanently stale, so the fill becomes an estimate and drifting low means
+    writing into a nearly-full FIFO, which is where the 32-sample block losses
+    come from.
+
+    A deeper FIFO breaks the trap, and the manual documents the knob:
+    FDwfDeviceOpenEx takes "analogout-memory:#", the memory allocated to the
+    analog-out instruments in BYTES.
+    """
+    ndev, ncfg = ctypes.c_int(), ctypes.c_int()
+    check(dwf, dwf.FDwfEnum(ctypes.c_int(0), ctypes.byref(ndev)), "FDwfEnum")
+    check(dwf, dwf.FDwfEnumConfig(ctypes.c_int(0), ctypes.byref(ncfg)),
+          "FDwfEnumConfig")
+    cfg, best = -1, -1
+    for i in range(ncfg.value):
+        play, scope = ctypes.c_int(), ctypes.c_int()
+        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogOutPlaySize,
+                               ctypes.byref(play))
+        dwf.FDwfEnumConfigInfo(ctypes.c_int(i), DECIAnalogInBufferSize,
+                               ctypes.byref(scope))
+        if play.value == 0 and scope.value > best:
+            cfg, best = i, scope.value
+    if cfg < 0:
+        raise RuntimeError("No streaming configuration found.")
+    print(f"\nanalogout-memory probe, streaming configuration {cfg}")
+    print(f"  FIFO must exceed {100e6 / 7 * 0.00247:,.0f} samples for the "
+          f"documented loop to fit (2470 us at 14.286 MS/s)")
+    print(f"\n  {'analogout-memory':>18} {'DataInfo max':>13} "
+          f"{'PlayInfo max':>13} {'free after prime':>17} {'FIFO ms':>8}")
+    rate = 100e6 / 7
+    for mib in (None, 16, 64, 128, 256, 512):
+        opts = [f"config:{cfg}"]
+        if mib is not None:
+            opts.append(f"analogout-memory:{mib * 1024 * 1024}")
+        hdwf = ctypes.c_int()
+        ok = False
+        for sep in (" ", ","):
+            o = sep.join(opts).encode()
+            if dwf.FDwfDeviceOpenEx(o, ctypes.byref(hdwf)) == 1 \
+                    and hdwf.value != 0:
+                ok = True
+                break
+        label = "default" if mib is None else f"{mib} MiB"
+        if not ok:
+            print(f"  {label:>18} open refused: {last_error(dwf)[:40]}")
+            continue
+        try:
+            ch = ctypes.c_int(0)
+            dmin, dmax = ctypes.c_int(), ctypes.c_int()
+            pmin, pmax = ctypes.c_int(), ctypes.c_int()
+            dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+            dwf.FDwfAnalogOutNodeEnableSet(hdwf, ch, AnalogOutNodeCarrier,
+                                           ctypes.c_int(1))
+            dwf.FDwfAnalogOutNodeFunctionSet(hdwf, ch, AnalogOutNodeCarrier,
+                                             funcPlayPattern)
+            dwf.FDwfAnalogOutNodeFrequencySet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_double(rate))
+            dwf.FDwfAnalogOutNodeAmplitudeSet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_double(1.0))
+            dwf.FDwfAnalogOutNodeDataInfo(hdwf, ch, AnalogOutNodeCarrier,
+                                          ctypes.byref(dmin),
+                                          ctypes.byref(dmax))
+            dwf.FDwfAnalogOutNodePlayInfo(hdwf, ch, AnalogOutNodeCarrier,
+                                          ctypes.byref(pmin),
+                                          ctypes.byref(pmax))
+            n = max(1, dmax.value)
+            pre = (ctypes.c_double * n)()
+            dwf.FDwfAnalogOutNodeDataSet(hdwf, ch, AnalogOutNodeCarrier, pre,
+                                         ctypes.c_int(n))
+            dwf.FDwfAnalogOutRunSet(hdwf, ch, ctypes.c_double(0.0))
+            freev = ctypes.c_int(-1)
+            if dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)) == 1:
+                sts = ctypes.c_ubyte()
+                lost, corr = ctypes.c_int(), ctypes.c_int()
+                dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts))
+                dwf.FDwfAnalogOutNodePlayStatus(
+                    hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(freev),
+                    ctypes.byref(lost), ctypes.byref(corr))
+            depth = max(dmax.value, freev.value)
+            print(f"  {label:>18} {dmax.value:>13,} {pmax.value:>13,} "
+                  f"{freev.value:>17,} {depth / rate * 1000:>8.2f}")
+        finally:
+            dwf.FDwfAnalogOutReset(hdwf, ctypes.c_int(0))
+            dwf.FDwfDeviceClose(hdwf)
+    print("\n  If DataInfo max or free grows with the option, the documented")
+    print("  loop becomes possible and the block losses should disappear.")
+
+
 def transport_info(dwf):
     """Which transport is the device on, and what does a round trip cost?
 
@@ -4518,13 +4651,14 @@ def main():
              "--deep", "--stream", "--color", "--progressive", "--locked",
              "--run-infinite", "--series-75", "--max-res", "--motion",
              "--motion-stream", "--stream-rate-check", "--stream-static",
+             "--stream-doc",
              # measurement
              "--dump", "--verify", "--analyze", "--scan", "--compare",
              "--capture",
              # device capability probes
              "--play-info", "--play-test", "--play-configs", "--pattern-info",
              "--clock-info", "--stream-probe", "--feed-matrix",
-             "--feed-tune", "--transport",
+             "--feed-tune", "--transport", "--memory-probe",
              # A/B switches for things that were tested and are documented
              "--no-filter", "--sync-tip-zero", "--vbi-black",
              "--no-loop-align", "--fsc-nominal"}
@@ -4570,6 +4704,7 @@ def main():
     global SOURCE_SERIES_75R, MOTION_SECONDS, STREAM_RATE_CHECK
     global STREAM_CAPTURE_AT, STREAM_FUNC, STREAM_STATIC, STREAM_ALIGN
     global STREAM_RESYNC_S, STREAM_GUARD, STREAM_CAPTURE_S, STREAM_SQUARE
+    global STREAM_DOC
     # --locked: the combination measured to lock a Leader LV5700A through a
     # vectorscope-and-monitor chain. Individual flags still override it.
     if "--locked" in argv:
@@ -4594,6 +4729,7 @@ def main():
     STREAM_GUARD = max(0, opt("--stream-guard", int, STREAM_GUARD))
     STREAM_CAPTURE_S = opt("--stream-capture-s", float, STREAM_CAPTURE_S)
     STREAM_SQUARE = max(0, opt("--stream-square", int, 0))
+    STREAM_DOC = "--stream-doc" in argv
     STREAM_FUNC = opt("--stream-func", str, STREAM_FUNC)
     if STREAM_FUNC not in ("play", "pattern"):
         raise RuntimeError("--stream-func must be 'play' or 'pattern'.")
@@ -4661,6 +4797,10 @@ def main():
 
     if "--transport" in argv:
         transport_info(dwf)
+        return
+
+    if "--memory-probe" in argv:
+        memory_probe(dwf)
         return
 
     if "--feed-matrix" in argv:

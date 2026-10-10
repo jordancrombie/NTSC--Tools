@@ -218,6 +218,48 @@ stream -- and `lost`/`corrupt` report zero throughout.
 5,720 against 36 of 5,720 unaligned, net -696 against -655. The device drops
 blocks regardless of how the writes are shaped.
 
+**ROOT CAUSE: one 32-sample block is lost per FIFO revolution.** Found by
+running the SDK's documented loop (`--stream-doc`) instead of the clock-paced
+one, which removes the overfeeding and leaves only the device's own defect:
+
+| | |
+|---|---|
+| defects | 14 of 4,448 half-periods |
+| size | **every one exactly -32.00 samples** |
+| spacing | **328 half-periods = 32,800 samples, range 328..328** |
+
+32,800 - 32 = **32,768**, the FIFO size exactly. So the gap between losses is
+one FIFO consumed plus the 32 that vanished: the ring buffer drops a
+32-sample block every time it wraps. 32/32,800 = **0.0976%**, deterministic,
+and independent of congestion, scheduling or how we shape our writes -- which
+is why `--stream-align 32` changed nothing.
+
+The clock-paced loop shows this PLUS irregular extra losses (0.2538% against
+0.1008% for the documented loop at the same rate). Those extras are
+overfeeding -- my first theory, which I abandoned for the wrong reason: the
+guard band I added to test it also shrank the chunk and starved the feed, and
+I read the starvation as a refutation.
+
+**Why the documented loop is not a fix either.** It costs 2470 us per pass
+(AnalogOutStatus 1393 + PlayData 1077, the latter FLAT regardless of size)
+while the FIFO holds only 2294 us at 14.286 MS/s, so the colour rate is
+structurally out of reach -- the buffer empties before the next refill can
+arrive. The arithmetic says 11.111 MS/s should fit (2949 us of FIFO), but
+measured it sustained only 8.769 MS/s, so PlayData evidently blocks when the
+buffer is full and the real per-pass cost is higher than the isolated timing.
+
+| call | cost | notes |
+|---|---|---|
+| `FDwfAnalogOutStatus` | 1393 us | the only real device round trip |
+| `FDwfAnalogOutNodePlayData` | ~1077 us | FLAT from 1 Ki to 32 Ki samples |
+| `FDwfAnalogOutNodePlayStatus` | 0.7 us | local read of cached state |
+| `FDwfDeviceParamGet` | 0.4 us | local |
+
+`analogout-memory:#` in `FDwfDeviceOpenEx` does NOT deepen the FIFO -- tried
+at 16, 64, 128, 256 and 512 MiB, `DataInfo` max stayed 32,768 every time. So
+the FIFO depth is fixed and the trap cannot be opened from the host: a valid
+`free` costs more time than the buffer holds.
+
 **The event rate is FIXED, not throughput-dependent, so no sample rate is
 clean.** Measured at two rates, both with a clean feed and a clean hardware
 control:
