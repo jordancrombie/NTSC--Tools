@@ -175,6 +175,56 @@ unterminated stub — the usual cause of edge overshoot), not amplitude. Level i
 `--level`, and with the resistor fitted `--level` means the same thing at the
 load as it did without it.
 
+**STRATEGY A WORKS: `Configure(ch, 3)` swaps a running `funcPlay` buffer with
+no glitch.** Measured with `--dual-probe`, which re-applies IDENTICAL data to a
+running channel so any defect is attributable to the apply itself, and uses a
+buffer that is a whole number of square periods so a restart would show as a
+phase jump:
+
+| applies in a 100 ms window | half-periods | defects |
+|---|---|---|
+| 0 (baseline) | 6,893 | 1 (0.01%) |
+| 2 | 12,842 | **0 — clean** |
+| **4** | **14,285** | **0 — clean**, range 99.997..100.004 |
+| 2, with the AD3 sacrificial workaround | 14,287 | 5 (0.03%) |
+
+Compare streamed `PlayData` at the same rate: 0.63% of half-periods defective.
+**Apply is clean; streaming is not.**
+
+The AD3 "sacrificial pair of applies" workaround is **harmful here** -- nudging
+the frequency by 0.01 Hz and back perturbs timing and produced the only
+defects in the set. Do not use it on this device.
+
+**Two constraints on using it:**
+
+1. **`DataSet` silently does nothing below about 2,000,000 samples.** With
+   `DataSet` of all +1.0 at amplitude 0.5, the output should be a flat
+   +500 mV. Measured: 200,000 samples gave -510..+510 mV (stale deep-memory
+   video, median +27), both with a bounded run and with run 0; 2,000,000
+   samples gave +496.6..+507.6 mV, flat. The call returns success either way.
+   This is why both earlier deep-memory square-wave controls came back as
+   video and why I read it as a device defect.
+
+2. **The swap is IMMEDIATE, not deferred to a buffer wrap.** Applying a buffer
+   with a different half-period and bucketing the capture into 10 ms slices:
+
+   | slice | median half-period | |
+   |---|---|---|
+   | 0-20 ms | 150 | stale content from the previous process -- deep memory persists |
+   | 20-60 ms | 100 | our initial `DataSet` takes effect ~20 ms in |
+   | 60-300 ms | 150 | the apply lands at ~60 ms, when `DataSet` returned at 61.3 ms |
+
+   The buffer period was 140 ms, so a deferred swap would have landed at
+   140 ms. It landed when the upload completed. So new content replaces old
+   under the playhead, and an apply issued mid-pass changes the remainder of
+   that pass.
+
+**Design that follows.** Buffer = M whole four-field sequences (>= 2 M
+samples). Sync structure is identical in every pass -- only the ball position
+differs -- so a mid-buffer swap cannot disturb sync timing at all; the worst
+case is the ball jumping by one buffer period of travel. Timing the upload to
+complete just after a wrap reduces even that toward zero.
+
 **MEASURED: streamed PlayData loses and gains whole 32-SAMPLE BLOCKS.**
 Found with `--stream-square`, which streams a square wave of known
 half-period in samples and measures each half-period back; DC cannot show a

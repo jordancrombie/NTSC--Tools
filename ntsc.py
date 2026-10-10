@@ -3017,6 +3017,253 @@ def motion_loop_plan(rate, seq_samples, seconds, cap):
     return n, loop_t, 2.0 * cyc_x / loop_t, 2.0 * cyc_y / loop_t, cyc_x, cyc_y
 
 
+def dual_apply_probe(dwf, hdwf, ch, rate, scale, half_n, nbuf, hz,
+                     sacrificial=False, capture_s=0.100, scope_rate=50e6,
+                     path=None, change_to=0):
+    """Does FDwfAnalogOutConfigure(ch, 3) swap a running buffer seamlessly?
+
+    The gating question for strategy A. The manual says fStart 3 "will apply
+    the configuration dynamically without changing the state of the
+    instrument", and samples/py/AnalogOut_DualBuffer.py uses it to replace
+    waveform data mid-run. If that is seamless with funcPlay on a deep-memory
+    channel, content can be swapped at loop boundaries with no PlayData and
+    therefore none of the FIFO-wrap loss.
+
+    The content applied is IDENTICAL each time, deliberately. Any defect in
+    the captured square wave is then attributable to the apply itself rather
+    than to the content changing, and the defect count can be compared against
+    the number of applies issued inside the capture window. A restart rather
+    than a swap also shows up, as a phase jump, because the buffer is a whole
+    number of square periods.
+
+    AD3 reports describe the FIRST apply after a channel start pausing the
+    output in 20-50% of cases, with a sacrificial pair of applies as the
+    workaround -- `sacrificial` exercises that.
+    """
+    period = 2 * half_n
+    n = max(period, (nbuf // period) * period)
+    if n < 2_000_000:
+        # Measured: a DataSet of 200,000 samples returns success and does
+        # NOT take effect -- the channel keeps playing stale deep-memory
+        # content. 2,000,000 does take effect. Refuse to measure below that,
+        # because the earlier square-wave controls came back as video for
+        # exactly this reason and I read it as a device defect.
+        raise RuntimeError(
+            f"--dual-buffer {n:,} is below the 2,000,000 samples at which "
+            f"DataSet was measured to actually take effect. A smaller buffer "
+            f"silently plays stale deep-memory content.")
+    print(f"\nDual-apply probe: funcPlay, {n:,} samples "
+          f"({n // period:,} whole square periods, {n / rate * 1000:.2f} ms "
+          f"playout)")
+    print(f"  applying identical data at {hz} Hz during a "
+          f"{capture_s * 1000:.0f} ms capture")
+    buf = (ctypes.c_double * n)()
+    make_square_filler(half_n)(buf, 0, n)
+
+    check(dwf, dwf.FDwfAnalogOutReset(hdwf, ch), "AnalogOutReset")
+    dwf.FDwfDeviceAutoConfigureSet(hdwf, ctypes.c_int(0))
+    check(dwf, dwf.FDwfAnalogOutNodeEnableSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_int(1)), "NodeEnableSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFunctionSet(
+        hdwf, ch, AnalogOutNodeCarrier, funcPlay), "NodeFunctionSet")
+    check(dwf, dwf.FDwfAnalogOutNodeFrequencySet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(rate / scale)),
+        "FrequencySet")
+    check(dwf, dwf.FDwfAnalogOutNodeAmplitudeSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(0.45)),
+        "AmplitudeSet")
+    check(dwf, dwf.FDwfAnalogOutNodeOffsetSet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.c_double(0.0)), "OffsetSet")
+    check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+        hdwf, ch, AnalogOutNodeCarrier, buf, ctypes.c_int(n)), "DataSet")
+    # Bound the run to OUR buffer. With RunSet(0.0) the device keeps playing
+    # whatever length was last established, so a smaller DataSet does not
+    # truncate it -- stale deep-memory content plays on past our samples,
+    # which is what made the first deep-memory square control come back as
+    # video. The buffer is sized so no repeat boundary falls inside a capture.
+    check(dwf, dwf.FDwfAnalogOutRunSet(hdwf, ch,
+                                       ctypes.c_double(n / rate)), "RunSet")
+    check(dwf, dwf.FDwfAnalogOutRepeatSet(hdwf, ch, ctypes.c_int(0)),
+          "RepeatSet")
+    print(f"      run bounded to {n / rate * 1000:.1f} ms so stale "
+          f"deep-memory content cannot play through")
+    check(dwf, dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(1)),
+          "Configure(start)")
+    report_output_window(dwf, hdwf, ch, 0.45, 0.0)
+    sts0 = ctypes.c_ubyte()
+    pmin, pmax = ctypes.c_int(), ctypes.c_int()
+    check(dwf, dwf.FDwfAnalogOutNodePlayInfo(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(pmin),
+        ctypes.byref(pmax)), "PlayInfo")
+    gr = ctypes.c_double()
+    check(dwf, dwf.FDwfAnalogOutRunGet(hdwf, ch, ctypes.byref(gr)), "RunGet")
+    gf = ctypes.c_double()
+    check(dwf, dwf.FDwfAnalogOutNodeFrequencyGet(
+        hdwf, ch, AnalogOutNodeCarrier, ctypes.byref(gf)), "FrequencyGet")
+    for _ in range(3):
+        check(dwf, dwf.FDwfAnalogOutStatus(hdwf, ch, ctypes.byref(sts0)),
+              "AnalogOutStatus")
+        time.sleep(0.05)
+    print(f"      state {DWF_STATE_NAMES.get(sts0.value, sts0.value)}, "
+          f"run {gr.value * 1000:.1f} ms, rate readback "
+          f"{gf.value / 1e6:.4f} MS/s, play memory {pmax.value:,}")
+    # Is W1 actually driven? A DC-ish check: our square sits at +/-0.405 V,
+    # so the capture should show about 810 mV peak to peak.
+    setup_scope(dwf, hdwf)
+    capture(dwf, hdwf, 25e6, 1 << 16)
+    chk = capture(dwf, hdwf, 50e6, 1 << 14)
+    print(f"      quick look at CH1: {min(chk) * 1000:+.1f} .. "
+          f"{max(chk) * 1000:+.1f} mV "
+          f"({(max(chk) - min(chk)) * 1000:.0f} mV p-p; expect ~810)")
+
+    # When change_to is set, the applied buffer carries a DIFFERENT
+    # half-period. Identical content proves the apply is glitch-free but
+    # cannot say WHEN the new data takes effect -- immediately under the
+    # playhead, or deferred to the next buffer wrap. That distinction decides
+    # the whole design: deferred means we can apply any time during a pass,
+    # immediate means the apply has to be timed to land just after a wrap and
+    # the content has to be the continuation from that point.
+    alt = None
+    if change_to:
+        # The capture must span a buffer wrap, and the apply must land well
+        # inside it, or immediate and deferred look identical. A 2 M buffer is
+        # 140 ms, so capture 300 ms and apply at 30 ms: immediate shows the
+        # change near 30-55 ms (a 16 MB DataSet takes ~24 ms), deferred shows
+        # it at the 140 ms wrap.
+        capture_s = max(capture_s, 0.300)
+        alt = (ctypes.c_double * n)()
+        make_square_filler(change_to)(alt, 0, n)
+        print(f"  applied buffer switches the half-period to {change_to} "
+              f"samples, so the transition can be located in time")
+
+    def apply_once():
+        src = alt if alt is not None else buf
+        check(dwf, dwf.FDwfAnalogOutNodeDataSet(
+            hdwf, ch, AnalogOutNodeCarrier, src, ctypes.c_int(n)),
+            "DataSet(apply)")
+        return dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(3))
+
+    if sacrificial:
+        # The reported AD3 workaround: nudge a parameter and apply twice
+        # before the real changes, to absorb the first-apply transient.
+        for f in (rate / scale + 0.01, rate / scale):
+            dwf.FDwfAnalogOutNodeFrequencySet(hdwf, ch, AnalogOutNodeCarrier,
+                                              ctypes.c_double(f))
+            dwf.FDwfAnalogOutConfigure(hdwf, ch, ctypes.c_int(3))
+        print("  issued a sacrificial pair of applies before the capture")
+
+    setup_scope(dwf, hdwf)
+    capture(dwf, hdwf, 25e6, 1 << 16)                  # discard: settling
+    cap_n = int(capture_s * scope_rate)
+    check(dwf, dwf.FDwfAnalogInFrequencySet(hdwf, ctypes.c_double(scope_rate)),
+          "InFrequencySet")
+    check(dwf, dwf.FDwfAnalogInBufferSizeSet(hdwf, ctypes.c_int(cap_n)),
+          "InBufferSizeSet")
+    check(dwf, dwf.FDwfAnalogInConfigure(hdwf, ctypes.c_int(1),
+                                         ctypes.c_int(1)), "InConfigure")
+
+    # Apply while the scope acquires, so applies and defects share a window.
+    sts = ctypes.c_ubyte()
+    applies = refused = 0
+    at = []
+    t0 = time.time()
+    nxt = 0.030 if change_to else 0.0
+    while True:
+        now = time.time() - t0
+        check(dwf, dwf.FDwfAnalogInStatus(hdwf, ctypes.c_int(0),
+                                          ctypes.byref(sts)), "InStatus")
+        if sts.value == DwfStateDone:
+            break
+        if now > capture_s + 5.0:
+            print("  capture timed out")
+            return
+        if hz > 0 and now >= nxt and not (change_to and applies):
+            t_a = time.time() - t0
+            if apply_once() == 1:
+                applies += 1
+                at.append(t_a)
+                print(f"  apply issued at {t_a * 1000:.1f} ms, returned at "
+                      f"{(time.time() - t0) * 1000:.1f} ms")
+            else:
+                refused += 1
+            nxt = now + 1.0 / hz
+    el = time.time() - t0
+    check(dwf, dwf.FDwfAnalogInStatus(hdwf, ctypes.c_int(1),
+                                      ctypes.byref(sts)), "InStatus(read)")
+    out = (ctypes.c_double * cap_n)()
+    check(dwf, dwf.FDwfAnalogInStatusData(hdwf, ctypes.c_int(0), out,
+                                          ctypes.c_int(cap_n)),
+          "InStatusData")
+    print(f"  {applies} applies issued, {refused} refused, over "
+          f"{el * 1000:.0f} ms")
+    samples = list(out)
+    if path:
+        with open(path, "w") as f:
+            for i, v in enumerate(samples):
+                f.write(f"{i / scope_rate:.9f},{v:.6f}\n")
+        print(f"  wrote {path}")
+    if change_to:
+        locate_change(samples, 1e6 / scope_rate, rate, half_n, change_to,
+                      at, n)
+    else:
+        square_integrity(samples, 1e6 / scope_rate, rate, half_n)
+        print(f"\n  CLEAN with {applies} applies in the window means "
+              f"Configure(ch, 3)\n  swaps a running buffer seamlessly, and "
+              f"strategy A is viable.\n  Roughly one defect per apply means "
+              f"the apply itself glitches.")
+    return applies
+
+
+def locate_change(samples, dt_us, rate, old_n, new_n, apply_times, nbuf):
+    """When does applied data actually reach the output?
+
+    Finds where the captured half-period switches from `old_n` to `new_n` and
+    compares that instant against when the apply was issued and against the
+    buffer period. Immediately at the apply means the swap happens under the
+    playhead; one buffer period later means it is deferred to the wrap.
+    """
+    srt = sorted(samples)
+    lo, hi = srt[len(srt) // 200], srt[-(len(srt) // 200) - 1]
+    mid = (lo + hi) / 2.0
+    hi_th, lo_th = mid + 0.25 * (hi - mid), mid - 0.25 * (mid - lo)
+    edges, state = [], 1 if samples[0] > mid else -1
+    for i in range(1, len(samples)):
+        v = samples[i]
+        if (state < 0 and v > hi_th) or (state > 0 and v < lo_th):
+            j = i
+            while j > 0 and ((samples[j - 1] > mid) == (state > 0)):
+                j -= 1
+            a, b = samples[j - 1], samples[j]
+            if b != a:
+                edges.append((j - 1 + (mid - a) / (b - a)) * dt_us)
+            state = -state
+    if len(edges) < 10:
+        print(f"  only {len(edges)} edges; cannot locate the change")
+        return
+    halves = [(edges[i + 1] - edges[i]) * rate / 1e6
+              for i in range(len(edges) - 1)]
+    # Rather than hunt for a transition with a fragile rule, bucket the
+    # half-periods into time slices and print the median of each. The timeline
+    # shows directly what played when, and where the change actually landed.
+    buf_ms = nbuf / rate * 1000
+    print(f"\n=== timeline: median half-period per 10 ms slice ===")
+    print(f"  buffer period {buf_ms:.1f} ms; apply issued at "
+          + ", ".join(f"{t * 1000:.1f} ms" for t in apply_times)
+          + f"; old {old_n}, new {new_n}")
+    slices = {}
+    for i, v in enumerate(halves):
+        k = int(edges[i] / 10000.0)          # edges are us -> 10 ms slices
+        slices.setdefault(k, []).append(v)
+    for k in sorted(slices):
+        xs = sorted(slices[k])
+        med = xs[len(xs) // 2]
+        tag = ("old" if abs(med - old_n) < abs(med - new_n) else "NEW")
+        bar = "#" * min(40, int(med / 5))
+        print(f"  {k * 10:4d}-{k * 10 + 10:4d} ms  n={len(xs):5d}  "
+              f"median {med:7.2f}  {tag}  {bar}")
+    return
+
+
 def square_deep_control(dwf, hdwf, ch, rate, scale, half_n,
                         capture_s=0.040, scope_rate=50e6, path=None):
     """Play the square wave from DEEP MEMORY and measure it the same way.
@@ -4725,6 +4972,7 @@ def main():
              "--play-info", "--play-test", "--play-configs", "--pattern-info",
              "--clock-info", "--stream-probe", "--feed-matrix",
              "--feed-tune", "--transport", "--memory-probe",
+             "--dual-probe", "--dual-sacrificial",
              # A/B switches for things that were tested and are documented
              "--no-filter", "--sync-tip-zero", "--vbi-black",
              "--no-loop-align", "--fsc-nominal"}
@@ -4735,7 +4983,8 @@ def main():
             "--bar-amp", "--motion-seconds", "--stream-capture",
             "--stream-func", "--stream-align", "--stream-resync",
             "--stream-guard", "--stream-capture-s", "--stream-div",
-            "--stream-square", "--stream-pad", "--stream-pad-every"}
+            "--stream-square", "--stream-pad", "--stream-pad-every",
+            "--dual-buffer", "--dual-hz", "--dual-change"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -4942,6 +5191,17 @@ def main():
             report_timing(spl, rate)
             print(f"      100 MHz/{div} exactly, line {line_hz:.2f} Hz "
                   f"({(line_hz / LINE_FREQ_HZ - 1) * 100:+.4f}%)")
+            if "--dual-probe" in argv:
+                dual_apply_probe(
+                    dwf, hdwf, ch, rate, scale,
+                    STREAM_SQUARE or 100,
+                    opt("--dual-buffer", int, 2_000_000),
+                    opt("--dual-hz", float, 100.0),
+                    sacrificial="--dual-sacrificial" in argv,
+                    path=SAVE_CAPTURE,
+                    change_to=opt("--dual-change", int, 0))
+                return
+
             if "--motion" in argv:
                 if STREAM_SQUARE and "--motion-stream" not in argv:
                     square_deep_control(dwf, hdwf, ch, rate, scale,
