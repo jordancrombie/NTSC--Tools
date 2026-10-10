@@ -772,12 +772,23 @@ START_WAIT_S = 1.0
 PLAY_SCALE_OVERRIDE = None
 
 
-def choose_stream_timing(max_rate):
+# Minimum samples per subcarrier cycle for colour. Picking purely on
+# line-rate accuracy once chose divider 14 -- 454 samples/line and 1.996
+# samples per cycle, exactly Nyquist -- which silently collapsed the chroma
+# peak from +102.5 to +94.66 IRE. Above about 3 the reconstruction holds.
+MIN_SAMPLES_PER_SC = 3.0
+
+
+def choose_stream_timing(max_rate, colour=False):
     """Integer divider of the AWG clock with the most accurate line rate.
 
     Same divider constraint as funcCustom -- the rate must be AWG_CLOCK_HZ/N
     or the hardware stalls whole samples -- but without the buffer ceiling,
     so N can be small and samples-per-line large.
+
+    For colour the rate must also carry the subcarrier: fsc is 227.5 x the
+    line rate, so a divider that leaves fewer than MIN_SAMPLES_PER_SC samples
+    per cycle is rejected however good its line rate looks.
     """
     best = None
     max_rate = min(max_rate, STREAM_MAX_RATE)
@@ -790,12 +801,19 @@ def choose_stream_timing(max_rate):
         if spl < 120:              # still far better than funcCustom's 54
             continue
         line_hz = rate / spl
+        if colour and rate / (SC_RATIO * line_hz) < MIN_SAMPLES_PER_SC:
+            continue
         err = abs(line_hz / LINE_FREQ_HZ - 1)
         key = (round(err, 9), -spl)
         if best is None or key < best[0]:
             best = (key, n, spl, rate, line_hz)
     if best is None:
-        raise RuntimeError("No usable streaming divider.")
+        raise RuntimeError(
+            f"No usable streaming divider at or below "
+            f"{max_rate / 1e6:.3f} MS/s"
+            + (f" with at least {MIN_SAMPLES_PER_SC} samples per subcarrier "
+               f"cycle. Raise --stream-rate." if colour else
+               ". Raise --stream-rate."))
     _, n, spl, rate, line_hz = best
     return n, spl, rate, line_hz
 
@@ -3974,7 +3992,7 @@ def feed_tune(dwf, secs=1.2):
                 ms, lo, co, v, depth, err = run(kind, tg)
                 ok = (not err and lo == 0 and co == 0
                       and abs(v - FEED_STREAM_V) < 0.15
-                      and ms >= tg / 1e6 * 0.95)
+                      and ms >= tg / 1e6 * 0.999)
                 if ok:
                     best[kind] = max(best.get(kind, 0.0), tg / 1e6)
                 # "meets rate", NOT "clean": this streams DC, and a dropped
@@ -3983,7 +4001,9 @@ def feed_tune(dwf, secs=1.2):
                 # capture showed had 179 us of jitter and 28 bad lines in 607.
                 # So this measures THROUGHPUT only. Signal integrity has to be
                 # measured on the real waveform, with --stream-capture.
-                verdict = err or ("meets rate" if ok else "short")
+                short = max(0.0, tg / 1e6 - ms) * 1e6
+                verdict = err or ("meets rate" if ok else
+                                  f"short {short / 908:.0f} lines/s")
                 print(f"  {kind:6} {tg / 1e6:9.3f} {ms:9.3f} {lo:>8,} "
                       f"{co:>8,} {v:+7.3f} {depth:>8,}  {verdict}")
         print()
@@ -4334,7 +4354,8 @@ def main():
                 setup_scope(dwf, hdwf)
                 capture(dwf, hdwf, 25e6, 1 << 16)      # discard: settling
                 scale = calibrate_play_rate(dwf, hdwf, ch, fn)
-            div, spl, rate, line_hz = choose_stream_timing(100e6)
+            div, spl, rate, line_hz = choose_stream_timing(
+                100e6, colour="--color" in argv)
             print(f"Deep-memory playback: {frame_lines()}-line "
                   f"{'interlaced' if INTERLACED else 'progressive'}, "
                   f"func {fn.value}, rate scale {scale:.4f}x")
