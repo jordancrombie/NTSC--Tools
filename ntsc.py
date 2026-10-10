@@ -2791,6 +2791,16 @@ STREAM_CAPTURE_AT = None
 # the function is the variable.
 STREAM_FUNC = "pattern"
 STREAM_RUN_S = 3600.0              # "play" needs a finite run length
+# --stream-static: stream the static bars with NO ball, so the content is
+# identical to what --deep plays perfectly. That reduces the difference between
+# "perfect" and "rolling" to delivery alone -- chunked PlayData in config 5
+# versus one DataSet in config 3 -- with content held constant.
+STREAM_STATIC = False
+# --stream-align G: quantise every PlayData to a multiple of G samples. We
+# currently send a continuously varying count, and --feed-matrix could not have
+# noticed per-chunk padding or alignment because it streamed DC. 908 is one
+# line; AnalogIn reports a buffer granularity of 16.
+STREAM_ALIGN = 1
 DWF_STATE_NAMES = {DwfStateArmed: "armed", DwfStateDone: "done",
                    DwfStateRunning: "running", DwfStateWait: "wait"}
 
@@ -3018,7 +3028,7 @@ def start_motion(dwf, hdwf, ch, spl, rate, scale):
     return big_n
 
 
-def stream_chunk(fifo, fill, remaining):
+def stream_chunk(fifo, fill, remaining, align=1):
     """Samples to hand over now, given the estimated FIFO fill.
 
     `fill` may be NEGATIVE when the feed has fallen behind the playhead, and
@@ -3032,7 +3042,10 @@ def stream_chunk(fifo, fill, remaining):
     estimate does, the request can never exceed the FIFO.
     """
     room = fifo - max(0.0, fill)
-    return max(0, int(min(room, fifo, remaining)))
+    n = max(0, int(min(room, fifo, remaining)))
+    if align > 1:
+        n -= n % align
+    return n
 
 
 def pick_stream_config(dwf, force=None):
@@ -3213,7 +3226,7 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
             fill = fed - now * rate
             if now > 0.25 and cap_state != "armed":
                 worst_fill = min(worst_fill, fill)
-            n = 0 if cap_state == "armed" else stream_chunk(fifo, fill, fifo)
+            n = 0 if cap_state == "armed" else stream_chunk(fifo, fill, fifo, STREAM_ALIGN)
             if n > 0:
                 fill_fn(staging, abs_pos, n)
                 if dwf.FDwfAnalogOutNodePlayData(
@@ -3260,7 +3273,7 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                     # Fill the FIFO completely first: once armed we stop
                     # feeding, so whatever is in there is all the signal the
                     # capture will see.
-                    n0 = stream_chunk(fifo, fed - now * rate, fifo)
+                    n0 = stream_chunk(fifo, fed - now * rate, fifo, STREAM_ALIGN)
                     if n0 > 0:
                         fill_fn(staging, abs_pos, n0)
                         check(dwf, dwf.FDwfAnalogOutNodePlayData(
@@ -3364,6 +3377,24 @@ def stream_feed(dwf, hdwf, ch, fill_fn, rate, fifo, poll=0.1, report=5.0,
                   f"{line_hz / 262.5:.4f} Hz (NTSC 59.9401)")
 
 
+def make_background_filler(bg, total):
+    """A fill_fn that streams the static background, with no ball painted.
+
+    Exists to hold content constant: this is byte-for-byte what --deep loads
+    into deep memory and plays perfectly, so if streaming it still rolls, the
+    cause is delivery and not anything we generate.
+    """
+    def fill(dst, abs_pos, n):
+        done = 0
+        while done < n:
+            off = (abs_pos + done) % total
+            m = min(n - done, total - off)
+            ctypes.memmove(ctypes.byref(dst, done * 8),
+                           ctypes.byref(bg, off * 8), m * 8)
+            done += m
+    return fill
+
+
 def make_motion_filler(bg, total, geom, ball_n, blank_n, rate):
     """A fill_fn that paints the bouncing ball over the background on demand.
 
@@ -3424,7 +3455,13 @@ def start_motion_stream(dwf, hdwf, ch, spl, rate, scale):
     bg, total, amplitude, offset, ball_n, blank_n, fsc = \
         build_motion_background(spl, rate)
     geom = motion_geometry(spl, rate)
-    fill_fn = make_motion_filler(bg, total, geom, ball_n, blank_n, rate)
+    if STREAM_STATIC:
+        fill_fn = make_background_filler(bg, total)
+        print("      --stream-static: no ball. Content is byte-identical to "
+              "what --deep plays,\n"
+              "      so delivery is the only remaining difference.")
+    else:
+        fill_fn = make_motion_filler(bg, total, geom, ball_n, blank_n, rate)
 
     if STREAM_CAPTURE_AT is not None:
         # Before the AWG, matching the order feed_one_config used -- which did
@@ -3985,7 +4022,7 @@ def main():
              # generation
              "--deep", "--stream", "--color", "--progressive", "--locked",
              "--run-infinite", "--series-75", "--max-res", "--motion",
-             "--motion-stream", "--stream-rate-check",
+             "--motion-stream", "--stream-rate-check", "--stream-static",
              # measurement
              "--dump", "--verify", "--analyze", "--scan", "--compare",
              "--capture",
@@ -4001,7 +4038,7 @@ def main():
             "--sys-clock", "--capture", "--seconds", "--level",
             "--burst-start", "--burst-amp", "--copies", "--setup",
             "--bar-amp", "--motion-seconds", "--stream-capture",
-            "--stream-func"}
+            "--stream-func", "--stream-align"}
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         print("Flags:")
@@ -4034,7 +4071,7 @@ def main():
     global VBI_BLACK, LEVEL, BURST_START_US, BURST_AMP
     global RUN_INFINITE, COPIES
     global SOURCE_SERIES_75R, MOTION_SECONDS, STREAM_RATE_CHECK
-    global STREAM_CAPTURE_AT, STREAM_FUNC
+    global STREAM_CAPTURE_AT, STREAM_FUNC, STREAM_STATIC, STREAM_ALIGN
     # --locked: the combination measured to lock a Leader LV5700A through a
     # vectorscope-and-monitor chain. Individual flags still override it.
     if "--locked" in argv:
@@ -4053,6 +4090,8 @@ def main():
     set_bar_amp(opt("--bar-amp", float, BAR_AMP * 100.0))
     STREAM_RATE_CHECK = "--stream-rate-check" in argv
     STREAM_CAPTURE_AT = opt("--stream-capture", float, None)
+    STREAM_STATIC = "--stream-static" in argv
+    STREAM_ALIGN = max(1, opt("--stream-align", int, 1))
     STREAM_FUNC = opt("--stream-func", str, STREAM_FUNC)
     if STREAM_FUNC not in ("play", "pattern"):
         raise RuntimeError("--stream-func must be 'play' or 'pattern'.")
